@@ -1,9 +1,9 @@
 from fastapi import FastAPI, HTTPException, Request, Header, BackgroundTasks
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-from pathlib import Path
+
 from dotenv import load_dotenv
-import os, json, hmac, hashlib, re, sys
+import os, json, hmac, hashlib, re
 
 from pydantic.type_adapter import R
 
@@ -11,7 +11,7 @@ from clientbot.seatalk_service.seatalk_client import seatalk_client
 from engine import init_engine, translate_execute
 from translation_logger_db import translation_logger_db
 from doc_translate.sheet_translator import translate_sheet
-from utils import setup_server_logging, get_webhook_logger
+from utils import setup_server_logging, get_webhook_logger, is_date_or_version_pattern
 
 
 load_dotenv()
@@ -200,22 +200,28 @@ async def process_group_message(group_id: str, user_text: str, message_id: str, 
         
     # case 4: 일반 번역
     else:
-        logger.info(f"[Group] No Google Sheets URL detected, calling translation engine")
         if user_text.strip():
-            try:
-                result = translate_execute(user_text)
-                translation = result.get("translation")
-                # ----- 번역 로그 저장 (ML 학습용) -----
-                translation_logger_db.log_translation(result, source="api")
-                
-                if translation:
-                    reply_text = f"📝 번역 결과:\n{translation}"
-                else:
-                    reason = result.get("reason", "unknown")
-                    reply_text = f"❌ 번역할 수 없습니다. (사유: {reason})"
-            except Exception as e:
-                logger.error(f"[Group] Translation error: {e}")
-                reply_text = f"⚠️ 번역 중 오류가 발생했습니다: {str(e)}"
+            # 날짜/버전 패턴 체크 (번역 스킵)
+            if is_date_or_version_pattern(user_text):
+                logger.info(f"[Group] Skipping translation: date/version pattern detected - %r", user_text)
+                reply_text = f"📝 번역 결과:\n{user_text}"
+            else:
+                logger.info(f"[Group] No Google Sheets URL detected, calling translation engine")
+                try:
+                    result = translate_execute(user_text)
+                    translation = result.get("translation")
+                    
+                    # ----- 번역 로그 저장 (ML 학습용) -----
+                    translation_logger_db.log_translation(result, source="api")
+                    
+                    if translation:
+                        reply_text = f"📝 번역 결과:\n{translation}"
+                    else:
+                        reason = result.get("reason", "unknown")
+                        reply_text = f"❌ 번역할 수 없습니다. (사유: {reason})"
+                except Exception as e:
+                    logger.error(f"[Group] Translation error: {e}")
+                    reply_text = f"⚠️ 번역 중 오류가 발생했습니다: {str(e)}"
         else:
             reply_text = ("💡번역할 텍스트를 입력해주세요.\n\n"
                           "또는 Google Sheets URL + Range를 입력하시면 문서 번역을 시작합니다.\n"
@@ -276,22 +282,28 @@ async def process_single_message(employee_code: str, user_text: str, message_id:
         
     # case 3: 일반 번역
     else:
-        logger.info(f"No Google Sheets URL detected, calling translation engine")
         if user_text.strip():
-            try:
-                result = translate_execute(user_text)
-                translation = result.get("translation")
-                # ----- 번역 로그 저장 (ML 학습용) -----
-                translation_logger_db.log_translation(result, source="api")
-                
-                if translation:
-                    reply_text = f"📝 번역 결과:\n{translation}"
-                else:
-                    reason = result.get("reason", "unknown")
-                    reply_text = f"❌ 번역할 수 없습니다. (사유: {reason})"
-            except Exception as e:
-                logger.error(f"Translation error: {e}")
-                reply_text = f"⚠️ 번역 중 오류가 발생했습니다: {str(e)}"
+            # 날짜/버전 패턴 체크 (번역 스킵)
+            if is_date_or_version_pattern(user_text):
+                logger.info(f"Skipping translation: date/version pattern detected - %r", user_text)
+                reply_text = f"📝 번역 결과:\n{user_text}"
+            else:
+                logger.info(f"No Google Sheets URL detected, calling translation engine")
+                try:
+                    result = translate_execute(user_text)
+                    translation = result.get("translation")
+                    
+                    # ----- 번역 로그 저장 (ML 학습용) -----
+                    translation_logger_db.log_translation(result, source="api")
+                    
+                    if translation:
+                        reply_text = f"📝 번역 결과:\n{translation}"
+                    else:
+                        reason = result.get("reason", "unknown")
+                        reply_text = f"❌ 번역할 수 없습니다. (사유: {reason})"
+                except Exception as e:
+                    logger.error(f"Translation error: {e}")
+                    reply_text = f"⚠️ 번역 중 오류가 발생했습니다: {str(e)}"
         else:
             reply_text = (
                 "💡 번역할 텍스트를 입력해주세요.\n\n"

@@ -2,7 +2,7 @@
 import re, time
 
 from doc_translate.google_spreadsheets import get_spreadsheets_read, put_spreadsheets_write
-from utils import get_translator_logger
+from utils import get_translator_logger, is_date_or_version_pattern
 
 logger = get_translator_logger("doc_translate.sheet_translator")
 
@@ -57,6 +57,7 @@ def translate_sheet(
     
     # 2. 배치 번역 처리
     results = []
+    translation_results = []            # DB 배치 저장용
     success_count = 0
     fail_count = 0
     
@@ -67,22 +68,28 @@ def translate_sheet(
         
         raw_query = row[0].strip()
         
+        # 날짜/버전 패턴 체크 (번역 스킵)
+        if is_date_or_version_pattern(raw_query):
+            logger.info(f"[sheet_translator] Row {i}: Skipping date/version pattern - %r", raw_query)
+            results.append(raw_query)  # 원문 그대로
+            success_count += 1
+            continue
+        
         try:
             result = translate_execute(raw_query)
             translation = result.get("translation", "")
             results.append(translation)
             success_count += 1
             
-            # 각 번역 결과를 DB에 저장 (ML 학습용)
-            from translation_logger_db import translation_logger_db
-            translation_logger_db.log_translation(result, source="api")
+            # DB 배치 저장을 위해 리스트에 추가
+            translation_results.append(result)
         
         except Exception as e:
             logger.error(f"[sheet_translator] Row {i} translation failed: {e}")
             results.append("")
             fail_count += 1
         
-        time.sleep(2.0)      # 2초 딜레이 (API 호출 제한 방지)
+        time.sleep(0.5)      # 0.5초 딜레이 (API 호출 제한 방지)
         
         if progress_callback and (i + 1) % 10 == 0:
             try:
@@ -91,6 +98,12 @@ def translate_sheet(
                     asyncio.create_task(progress_callback(i + 1, total_count))
             except:
                 pass
+            
+    if translation_results:
+        from translation_logger_db import translation_logger_db
+        logger.info("[sheet_translator] Saving %d results to DB (batch mode)", len(translation_results))
+        translation_logger_db.log_translation_batch(translation_results, source="api")
+        logger.info("[sheet_translator] DB batch save completed")
             
     logger.info(f"[sheet_translator] Translation done: success={success_count}, fail={fail_count}")
     

@@ -279,3 +279,74 @@ def has_hangul(text: str) -> bool:
         has_hangul("超现象 관리국") → True
     """
     return bool(re.search(r"[\uac00-\uD7A3]", text))
+
+
+def is_date_or_version_pattern(text: str) -> bool:
+    """
+    텍스트가 날짜 또는 버전 패턴인지 확인
+    
+    번역할 필요가 없는 패턴들:
+    - 날짜: 2025.12.10, 2025-12-10, 2025/12/10
+    - 버전: 1.1.189, v2.0.1, Ver 1.2.3
+    - 시간: 12:30, 14:00:00
+    - 숫자만: 12345 (5자리 이상)
+    
+    Args:
+        text: 검사할 텍스트
+    
+    Returns:
+        True if 번역 스킵 대상 패턴, False otherwise
+    
+    예시:
+        is_date_or_version_pattern("2025.12.10") → True
+        is_date_or_version_pattern("1.1.189") → True
+        is_date_or_version_pattern("v2.0.1") → True
+        is_date_or_version_pattern("12:30") → True
+        is_date_or_version_pattern("12345") → True (5자리 이상 숫자)
+        is_date_or_version_pattern("게임 시작") → False
+        is_date_or_version_pattern("1.5") → False (너무 짧음)
+    """
+    if not text or not text.strip():
+        return False
+    
+    text = text.strip()
+    
+    # 패턴 1: 날짜 (YYYY.MM.DD, YYYY-MM-DD, YYYY/MM/DD 등)
+    # 예: 2025.12.10, 2025-01-28, 2025/12/31
+    date_pattern = r'^\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}$'
+    if re.match(date_pattern, text):
+        return True
+    
+    # 패턴 2: 버전 (X.Y.Z 형식, v 접두사 포함)
+    # 예: 1.1.189, v2.0.1, Ver 1.2.3, version 1.0
+    # Ver와 숫자 사이 공백 허용
+    version_pattern = r'^(v|ver|version)\s*\d+\.\d+(\.\d+)*$'
+    if re.match(version_pattern, text, re.IGNORECASE):
+        return True
+    
+    # 패턴 2-1: 순수 버전 번호 (접두사 없음, 3개 이상 숫자)
+    # 예: 1.1.189 (O), 1.5 (X - 너무 짧음)
+    pure_version_pattern = r'^\d+\.\d+\.\d+(\.\d+)*$'
+    if re.match(pure_version_pattern, text):
+        return True
+    
+    # 패턴 3: 시간 (HH:MM 또는 HH:MM:SS)
+    # 예: 12:30, 14:00:00
+    time_pattern = r'^\d{1,2}:\d{2}(:\d{2})?$'
+    if re.match(time_pattern, text):
+        return True
+    
+    # 패턴 4: 순수 숫자만 (5자리 이상)
+    # 예: 12345, 100000
+    # 너무 짧은 숫자는 제외 (1, 2, 12 등은 번역 가능한 용어일 수 있음)
+    number_pattern = r'^\d{5,}$'
+    if re.match(number_pattern, text):
+        return True
+    
+    # 패턴 5: 년-월 형식 (YYYY.MM, YYYY-MM)
+    # 예: 2025.12, 2025-01
+    year_month_pattern = r'^\d{4}[.\-]\d{1,2}$'
+    if re.match(year_month_pattern, text):
+        return True
+    
+    return False

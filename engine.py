@@ -1,7 +1,8 @@
 import time
+import warnings
 
-from core.config import Settings, TranslationReason
-from core.config import load_env, setup_settings
+from core.config import Settings
+from core.config import load_env, setup_settings, TranslationReason
 from core.init_document_node import load_nodes_cache
 from core.retriever import build_retrievers
 from core.glossary import build_glossary_map
@@ -11,9 +12,11 @@ from llama_index.retrievers.bm25 import BM25Retriever
 from preprocessor import (
     detect_intent, preprocess_query_smart
 )
-from indexing import init_chroma
 from utils import get_translator_logger
+from indexing import init_chroma
 
+# BM25 tokenizer deprecation warning 무시
+warnings.filterwarnings("ignore", message=".*tokenizer parameter is deprecated.*")
 
 logger = get_translator_logger("engine")
 
@@ -121,6 +124,7 @@ def translate_execute(raw_query: str) -> dict:
     src_lang = intent["src_lang"]
     
     if mode == "term":
+        # 단어 모드: 단방향 -> 조건부 양방향
         preprocessed_query = preprocess_query_smart(raw_query, llm=Settings.llm)
         
         # translate_term() 호출 (양방향 검색, 모든 feature 포함)
@@ -151,13 +155,14 @@ def translate_execute(raw_query: str) -> dict:
         return result
     
     elif mode == "sentence":
-        # 문장 모드 (glossary 기반 번역)
+        # 문장 모드 (glossary 기반 번역): 항상 양방향 검색
         result = translate_sentence_with_glossary(
-            raw_query, 
-            cn_retriever,  # hybrid retriever로 사용
+            raw_query,
+            cn_retriever,
+            ko_retriever,
             src_lang=src_lang, 
             use_llm=True,
-            tm_retriever=None  # TM은 추후 별도 구현
+            tm_retriever=None,
         )
         result["raw_query"] = raw_query
         result["mode"] = mode

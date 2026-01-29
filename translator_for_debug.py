@@ -7,7 +7,7 @@
 import argparse
 import time
 
-from utils import setup_logging, get_translator_logger
+from utils import setup_logging, get_translator_logger, is_date_or_version_pattern
 from engine import init_engine, translate_execute
 from core.config import load_env, setup_settings
 from indexing import run_indexing, run_indexing_for_text
@@ -48,6 +48,16 @@ def run_query_mode(initial_query: str | None = None):
     
     def handle_query(raw_query: str):
         """단일 쿼리 처리 및 결과 출력"""
+        
+        # 날짜/버전 패턴 체크 (번역 스킵)
+        if is_date_or_version_pattern(raw_query):
+            logger.info("Skipping translation: date/version pattern detected - %r", raw_query)
+            print(f"\n{'='*50}")
+            print(f"입력: {raw_query}")
+            print(f"번역: {raw_query} (날짜/버전 패턴 - 스킵)")
+            print(f"{'='*50}\n")
+            return
+        
         result = translate_execute(raw_query)
         
         # ML 학습용 데이터 로깅
@@ -131,6 +141,7 @@ def run_sheet_query_mode(
     
     # 3. 배치 번역 처리
     results = []
+    translation_results = []            # DB 배치 저장용
     success_count = 0
     fail_count = 0
     
@@ -141,16 +152,23 @@ def run_sheet_query_mode(
         
         raw_query = row[0].strip()
         
+        # 날짜/버전 패턴 체크 (번역 스킵)
+        if is_date_or_version_pattern(raw_query):
+            logger.info(f"[sheet query] Row {i}: Skipping date/version pattern - %r", raw_query)
+            results.append(raw_query)  # 원문 그대로
+            success_count += 1
+            continue
+        
         try:
             result = translate_execute(raw_query)
             translation = result.get("translation", "")
             
-            # ML 학습용 데이터 로깅
-            translation_logger_db.log_translation(result, source="debug_sheet")
+            # DB 배치 저장을 위해 리스트에 추가
+            translation_results.append(result)
             
             results.append(translation)
             success_count += 1
-            time.sleep(2.0)      # 2초 딜레이 (API 호출 제한 방지)
+            time.sleep(0.5)      # 0.5초 딜레이 (API 호출 제한 방지)
             
             if (i + 1) % 10 ==0:
                 print(f"    처리 중...{i + 1}/{len(rows)}")
@@ -159,7 +177,12 @@ def run_sheet_query_mode(
             logger.error(f"[sheet query] row {i} translation failed: {e}")
             results.append(f"[Error] {e}")
             fail_count += 1
-            time.sleep(2.0)      # 2초 딜레이 (API 호출 제한 방지)
+            time.sleep(0.5)      # 2초 딜레이 (API 호출 제한 방지)
+    
+    if translation_results:
+        logger.info("[sheet query] Saving %d results to DB (batch mode)", len(translation_results))
+        translation_logger_db.log_translation_batch(translation_results, source="debug_sheet")
+        logger.info("[sheet query] DB batch save completed")
     
     # 4. 결과 Report 출력
     print(f"\n{'='*50}")
@@ -202,11 +225,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 사용 예시:
-  # 기본 CSV 인덱싱 (기존 데이터 유지 + 추가)
+  # Glossary 폴더의 모든 CSV 인덱싱 (기존 데이터 유지 + 추가)
   python translator_for_debug.py --mode index_base
   
-  # 기본 CSV 인덱싱 (기존 데이터 삭제 후 새로 인덱싱)
+  # Glossary 폴더의 모든 CSV 인덱싱 (기존 데이터 삭제 후 새로 인덱싱)
   python translator_for_debug.py --mode index_base --clear
+  
+  # 특정 CSV 파일만 인덱싱
+  python translator_for_debug.py --mode index_base --csv_path "glossary/new_terms.csv"
   
   # 텍스트 인덱싱
   python translator_for_debug.py --mode index_text --cn "超现象管理局" --ko "초현상 관리국"
@@ -225,7 +251,11 @@ def main():
         "--mode",
         choices=["index_base", "index_text", "query", "sheet"],
         required=True,
-        help="index_base: 기본 CSV / index_text: 텍스트 인덱싱 / query: 번역 / sheet: Google Sheets"
+        help="index_base: CSV 인덱싱 / index_text: 텍스트 인덱싱 / query: 번역 / sheet: Google Sheets"
+    )
+    parser.add_argument(
+        "--csv_path",
+        help="인덱싱할 특정 CSV 파일 경로 (미 지정 시 glossary 폴더의 모든 CSV)"
     )
     parser.add_argument(
         "--sheet_url", 
@@ -271,8 +301,12 @@ def main():
     
     # 모드별 실행
     if args.mode == "index_base":
-        run_indexing(clear=args.clear)
-        print(f"[index_base] 완료 (clear={args.clear})")
+        # csv_path 지정하지 않으면 None -> 모든 CSV 자동 로드
+        run_indexing(csv_path=args.csv_path, clear=args.clear)
+        if args.csv_path:
+            print(f"\n[index_base] 완료: {args.csv_path} (clear={args.clear})")
+        else:
+            print(f"\n[index_base] 완료: glossary 폴더 전체 (clear={args.clear})")            
         
     elif args.mode == "index_text":
         if not args.cn and not args.ko:

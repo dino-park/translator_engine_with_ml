@@ -8,9 +8,10 @@ from core.retriever import search, format_candidates
 from core.normalizer import normalize_for_exact_match
 from core.glossary import lookup_glossary_by_segments, lookup_glossary, lookup_glossary_in_sentence, build_glossary_map_ko
 from core.chroma_utils import add_user_entry_to_glossary
-from core.config import Settings, TranslationReason
-from preprocessor import extract_terms_from_sentence
+from core.config import Settings, TranslationReason, SCORE_THRESHOLD
+from preprocessor import extract_terms_from_sentence, detect_mixed_language
 from utils import get_translator_logger
+from preprocessor import normalize_special_symbols
 
 logger = get_translator_logger("core.translator")
 
@@ -32,11 +33,11 @@ def _get_glossary_map_ko():
 # 정확 매칭 최소 점수 임계값
 # - 정확 매칭이라도 점수가 너무 낮으면 신뢰하지 않음 (오염된 데이터 방지)
 # - LLM fallback으로 추가된 잘못된 데이터는 보통 점수가 낮음
-EXACT_MATCH_MIN_SCORE = 0.04
+EXACT_MATCH_MIN_SCORE = 0.02  # Hybrid Search의 Reciprocal Rank Fusion score 범위 고려
 
 # === 1단계 대응: 신뢰도 기반 필터링 상수 ===
 # 1위-2위 점수 차이 최소값 (동점이면 확정 금지)
-CANDIDATE_GAP_THRESHOLD = 0.02
+CANDIDATE_GAP_THRESHOLD = 0.0005
 
 def translate_term(
     query: str,
@@ -49,10 +50,7 @@ def translate_term(
     glossary_map: dict[str, tuple[str, str]] = None
     ) -> dict:
     """
-    1) 양방향 hybrid 검색으로 가장 가까운 cn/ko 노드 검색
-    2) 정확 매칭이거나 score가 threshold 이상이면 cn/ko 반환
-    3) ko가 없거나 신뢰도가 낮으면 LLM 번역 시도
-    4) LLM fallback 전에 쿼리 세그먼트로 glossary 부분 매칭 시도
+    - 양방향 hybrid 검색 후 병합 후 정확 매칭 찾기
     
     Args:
         query: 검색 쿼리
@@ -69,9 +67,52 @@ def translate_term(
     # 정규화는 한 번만 수행 (lru_cache로 캐싱됨)
     normalized_query = normalize_for_exact_match(query)
     
-    # 양방향 검색 후 병합
-    merged_results = search(query, cn_retriever, ko_retriever, top_k=5)
-    logger.info("search returned %d merged results", len(merged_results))
+    # ===== 1단계: 단방향 검색 =====
+    merged_results = search(
+        query, cn_retriever, ko_retriever, 
+        src_lang=src_lang, top_k=5,
+        fallback_to_two_way=False
+    )
+    logger.info("search returned %d merged results (src_lang=%s)", len(merged_results), src_lang)
+    
+    # ===== 양방향 Fallback 조건 체크 =====
+    should_retry_two_way = False
+    retry_reason = None
+    
+    # Condition 1: 결과 없음
+    if len(merged_results) == 0:
+        should_retry_two_way = True
+        retry_reason = "no_results"
+        
+    # Condition 2: top_score가 너무 낮음
+    elif merged_results[0].get("score", 0) < SCORE_THRESHOLD:
+        should_retry_two_way = True
+        retry_reason = "low_top_score"
+        
+    # Condition 3: candidate_gap이 너무 작음 (동점)
+    elif len(merged_results) >= 2:
+        candidate_gap = merged_results[0]["score"] - merged_results[1]["score"]
+        if candidate_gap < CANDIDATE_GAP_THRESHOLD:
+            should_retry_two_way = True
+            retry_reason = f"small_gap({candidate_gap:.6f})"
+    
+    # Condition 4: exact_match가 없음 + BM25도 확신 없음
+    # (BM25 분석은 아래에서 수행되므로 그 이후에 체크함)
+    
+    # Condition 5: 혼합 언어 감지
+    if not should_retry_two_way and detect_mixed_language(query):
+        should_retry_two_way = True
+        retry_reason = "mixed_language_detected"
+    
+    # ===== 2단계: 위 조건 충족 시 양방향 재검색 =====
+    if should_retry_two_way:
+        logger.info("Retrying with two-way search (reason=%s)", retry_reason)
+        merged_results = search(
+            query, cn_retriever, ko_retriever,
+            src_lang=src_lang, top_k=5,
+            fallback_to_two_way=True
+        )
+        logger.info("Two-way search returned %d results", len(merged_results))
     
     # 후보 포맷팅
     candidates = format_candidates(merged_results, show=5)
@@ -81,15 +122,42 @@ def translate_term(
     bm25_retriever = cn_bm25_retriever if src_lang == "cn" else ko_bm25_retriever
     bm25_analysis = None
     if bm25_retriever:
-        bm25_results = bm25_retriever.retrieve(query)
+        # BM25 검색용 쿼리 정규화 (브래킷 제거)
+        query_for_bm25 = normalize_special_symbols(query)
+        logger.debug("BM25 query normalized: %r -> %r", query, query_for_bm25)
+        
+        bm25_results = bm25_retriever.retrieve(query_for_bm25)
         # merged_results는 dict 형태로 전달
         bm25_analysis = _analyze_bm25_results_for_merged(normalized_query, bm25_results, merged_results)
         logger.info(
             "BM25 analysis: exact_rank=%s, hybrid_rank=%s, in_hybrid=%s",
             bm25_analysis.get("bm25_exact_rank"),
-            bm25_analysis.get("bm25_hybrid_rank"),
-            bm25_analysis.get("bm25_in_hybrid")
+            bm25_analysis.get("bm25_top_rank_in_hybrid"),
+            bm25_analysis.get("is_bm25_top_in_hybrid")
         )
+    
+    # 1단계의 Condition 4: exact_match가 없음 + BM25도 확신 없음 Check (아직 양방향 재시도 안했다면)
+    if not should_retry_two_way:
+        has_exact_match = any(
+            normalize_for_exact_match(r.get("cn", "")) == normalized_query or
+            normalize_for_exact_match(r.get("ko", "")) == normalized_query
+            for r in merged_results
+        )
+        if not has_exact_match:
+            bm25_exact_rank = bm25_analysis.get("bm25_exact_rank") if bm25_analysis else None
+            
+            # BM25에서도 정확 매칭 없으면 양방향 재시도
+            if bm25_exact_rank is None:
+                should_retry_two_way = True
+                retry_reason = "no_exact_match_and_bm25_no_exact_match"
+                
+                logger.info("Retrying with two-way search (reason=%s)", retry_reason)
+                merged_results = search(
+                    query, cn_retriever, ko_retriever,
+                    src_lang=src_lang, top_k=5,
+                    fallback_to_two_way=True
+                )
+                logger.info("Two-way search returned %d results", len(merged_results))
     
     # ----- 상위 5개 후보 로깅 -----
     for idx, item in enumerate(merged_results[:5]):
@@ -105,10 +173,13 @@ def translate_term(
             logger.info("No match, trying LLM fallback for query=%r, src_lang=%s", query, src_lang)
             translated = _try_llm_translate_term(query, src_lang, candidates=candidates)
             if translated:
+                # LLM 번역 결과 후처리 (브래킷 제거)
+                translation_cleaned = normalize_special_symbols(translated)
+                
                 return {
                     "query": query,
                     "src_lang": src_lang,
-                    "translation": translated,
+                    "translation": translation_cleaned,
                     "reason": TranslationReason.LLM_TERM_FALLBACK_NO_MATCH,
                     "candidates": candidates,
                     "bm25_analysis": bm25_analysis,
@@ -158,7 +229,7 @@ def translate_term(
         
         # 정확 매칭 체크 (공백 무시)
         is_exact_cn = normalize_for_exact_match(r_cn) == normalized_query
-        is_exact_ko = normalize_for_exact_match(r_ko) == normalized_query
+        is_exact_ko = normalize_for_exact_match(r_ko) == normalized_query   # TODO: r_ko 정규화 여부 및 r_ko대신 r_cn의 metadata에서 ko를 추출할지 
         
         # 중국어 원문 → 한국어
         if src_lang == "cn" and is_exact_cn and r_ko:
@@ -188,10 +259,14 @@ def translate_term(
             logger.info("Exact match found: cn=%r, ko=%r, score=%s, bm25_rank=%s, gap=%s", 
                        r_cn, r_ko, r_score, bm25_exact_rank, 
                        f"{candidate_gap:.4f}" if candidate_gap is not None else "N/A")
+            
+            # 번역 결과 후처리 (브래킷 제거)
+            translation_cleaned = normalize_special_symbols(r_ko)
+            
             return {
                 "query": query,
                 "src_lang": src_lang,
-                "translation": r_ko,
+                "translation": translation_cleaned,
                 "reason": TranslationReason.EXACT_MATCH,
                 "candidates": candidates,
                 "bm25_analysis": bm25_analysis,
@@ -207,10 +282,14 @@ def translate_term(
                 break
             
             logger.info("Exact match found: cn=%r, ko=%r, score=%s", r_cn, r_ko, r_score)
+            
+            # 번역 결과 후처리 (브래킷 제거)
+            translation_cleaned = normalize_special_symbols(r_cn)
+            
             return {
                 "query": query,
                 "src_lang": src_lang,
-                "translation": r_cn,
+                "translation": translation_cleaned,
                 "reason": TranslationReason.EXACT_MATCH,
                 "candidates": candidates,
                 "bm25_analysis": bm25_analysis,
@@ -234,14 +313,17 @@ def translate_term(
         
         # 추가 조건: 1위 점수가 최소 임계값 이상이어야 함.
         if top_score >= EXACT_MATCH_MIN_SCORE:
-            # src_lang에 따라 번역 방향 결정
+            # src_lang에 따라 번역 방향 결정            
             if src_lang == "cn" and top_ko:
                 logger.info("No exact match but gap is large (%.4f >= %.4f), trusting top result: cn=%r -> ko=%r",
                             candidate_gap, CANDIDATE_GAP_THRESHOLD, top_cn, top_ko)
+                
+                translation_cleaned = normalize_special_symbols(top_ko)
+                
                 return {
                     "query": query,
                     "src_lang": src_lang,
-                    "translation": top_ko,
+                    "translation": translation_cleaned,
                     "reason": TranslationReason.TOP_CANDIDATE_HIGH_CONFIDENCE,
                     "candidates": candidates,
                     "bm25_analysis": bm25_analysis,
@@ -251,10 +333,13 @@ def translate_term(
             elif src_lang == "ko" and top_cn:
                 logger.info("No exact match but gap is large, trusting top result: ko=%r -> cn=%r",
                             top_ko, top_cn)
+                
+                translation_cleaned = normalize_special_symbols(top_cn)
+                
                 return {
                     "query": query,
                     "src_lang": src_lang,
-                    "translation": top_cn,
+                    "translation": translation_cleaned,
                     "reason": TranslationReason.TOP_CANDIDATE_HIGH_CONFIDENCE,
                     "candidates": candidates,
                     "bm25_analysis": bm25_analysis,
@@ -302,27 +387,31 @@ def translate_term(
     if use_llm_fallback:
         translated = _try_llm_translate_term(query, src_lang=src_lang, candidates=candidates, glossary_hints=glossary_hints)
         logger.info("LLM translation result: %r", translated)
+        #  TODO: 무조건 자동 저장이 아닌 신뢰도에 따라 저장되는 로직으로 변경 예정
         if translated:
-            # 새로운 용어를 Glossary에 저장 (자동 학습)
-            cn_text = query if src_lang == "cn" else translated
-            ko_text = translated if src_lang == "cn" else query
-            add_user_entry_to_glossary(
-                cn=cn_text,
-                ko=ko_text,
-                doc_type="user_term",
-                src_lang=src_lang,
-                reason="llm_term_fallback_no_exact_match"
-            )
+        #     # 새로운 용어를 Glossary에 저장 (자동 학습)
+        #     cn_text = query if src_lang == "cn" else translated
+        #     ko_text = translated if src_lang == "cn" else query
+        #     add_user_entry_to_glossary(
+        #         cn=cn_text,
+        #         ko=ko_text,
+        #         doc_type="user_term",
+        #         src_lang=src_lang,
+        #         reason="llm_term_fallback_no_exact_match"
+        #     )
             
             # 신뢰도 체크 결과 (LLM fallback으로 온 이유 기록)
             passed_bm25 = bm25_exact_rank is not None
             # candidate_gap이 None이면 경쟁자 없음 → True로 처리
             passed_gap = candidate_gap is None or candidate_gap >= CANDIDATE_GAP_THRESHOLD
             
+            # LLM 번역 결과도 후처리 (브래킷 제거)
+            translation_cleaned = normalize_special_symbols(translated)
+            
             return {
                 "query": query,
                 "src_lang": src_lang,
-                "translation": translated,
+                "translation": translation_cleaned,
                 "reason": TranslationReason.LLM_TERM_FALLBACK_NO_EXACT_MATCH,
                 "candidates": candidates,
                 "bm25_analysis": bm25_analysis,
@@ -353,7 +442,8 @@ def translate_term(
     
 def translate_sentence_with_glossary(
     sentence: str,
-    hybrid: "QueryFusionRetriever",
+    cn_retriever: "QueryFusionRetriever",
+    ko_retriever: "QueryFusionRetriever",
     src_lang: str,
     use_llm: bool = True,
     use_tm: bool = True,
@@ -366,12 +456,13 @@ def translate_sentence_with_glossary(
     1. [TM] Translation Memory 검색 → 완전 일치 시 즉시 반환
     2. [TM] 유사 문장 발견 시 참고용으로 저장
     3. 문장에서 용어 후보 추출
-    4. VectorDB에서 각 용어 검색하여 glossary 구성
+    4. VectorDB에서 각 용어 검색하여 glossary 구성 (src_lang 기반 선택적)
     5. LLM에 원문 + glossary + (유사 문장 참고) 제공하여 번역
     
     Args:
         sentence: 번역할 문장
-        hybrid: QueryFusionRetriever 인스턴스 (용어 검색용, num_queries=2)
+        cn_retriever: CN 컬렉션 QueryFusionRetriever (용어 검색용)
+        ko_retriever: KO 컬렉션 QueryFusionRetriever (용어 검색용)
         src_lang: 원본 언어 ("cn" 또는 "ko")
         use_llm: LLM 사용 여부
         use_tm: Translation Memory 사용 여부
@@ -390,6 +481,9 @@ def translate_sentence_with_glossary(
     logger.info("translate_sentence_with_glossary called, sentence=%r, src_lang=%s", sentence, src_lang)
     
     tm_match = None
+    
+    # src_lang에 따라 적절한 retriever 선택 (TM과 glossary에서 공용)
+    hybrid = cn_retriever if src_lang == "cn" else ko_retriever
     
     # ===== 0단계: Translation Memory 검색 =====
     # tm_retriever가 없으면 hybrid 사용 (하위 호환)
@@ -417,7 +511,7 @@ def translate_sentence_with_glossary(
     terms = extract_terms_from_sentence(sentence)
     logger.info("Extracted %d term candidates", len(terms))
     
-    # ===== 2단계: VectorDB에서 glossary 구성 =====
+    # ===== 2단계: VectorDB에서 glossary 구성 (src_lang 기반 선택적 검색) =====
     glossary = lookup_glossary(terms, hybrid, src_lang, max_hybrid_calls=3)
     logger.info("Glossary (VectorDB): %d matches - %s", len(glossary), glossary)
     
@@ -508,16 +602,17 @@ def translate_sentence_with_glossary(
         else:
             reason = TranslationReason.LLM_TRANSLATION  # 순수 LLM 번역
         
+        # TODO: 무조건 자동 저장이 아닌 신뢰도에 따라 저장되는 로직으로 변경 예정
         # 번역 결과를 Glossary에 저장 (Translation Memory로 활용)
-        cn_text = sentence if src_lang == "cn" else translation
-        ko_text = translation if src_lang == "cn" else sentence
-        add_user_entry_to_glossary(
-            cn=cn_text,
-            ko=ko_text,
-            doc_type="user_sentence",
-            src_lang=src_lang,
-            reason=reason
-        )
+        # cn_text = sentence if src_lang == "cn" else translation
+        # ko_text = translation if src_lang == "cn" else sentence
+        # add_user_entry_to_glossary(
+        #     cn=cn_text,
+        #     ko=ko_text,
+        #     doc_type="user_sentence",
+        #     src_lang=src_lang,
+        #     reason=reason
+        # )
         
         return {
             "query": sentence,
@@ -808,8 +903,8 @@ def _analyze_bm25_results_for_merged(normalized_query: str, bm25_results, merged
             "bm25_top_score": BM25 최상위 점수,
             "bm25_exact_rank": BM25에서 정확매칭 순위 (없으면 None),
             "bm25_exact_match": 정확매칭 내용 {cn, ko},
-            "bm25_in_hybrid": BM25 top이 merged에도 있는지,
-            "bm25_hybrid_rank": merged에서의 BM25 top 순위,
+            "is_bm25_top_in_hybrid": BM25 top이 merged에도 있는지,
+            "bm25_top_rank_in_hybrid": merged에서의 BM25 top 순위,
         }
     """
     
@@ -840,13 +935,13 @@ def _analyze_bm25_results_for_merged(normalized_query: str, bm25_results, merged
     # merged_results에서 BM25 top 항목 찾기 (Vector 기여 추론)
     merged_cn_list = [item.get("cn", "") for item in merged_results]
     
-    bm25_in_hybrid = bm25_top_cn in merged_cn_list if bm25_top_cn else False
-    bm25_hybrid_rank = (merged_cn_list.index(bm25_top_cn) + 1) if bm25_in_hybrid else None
+    is_bm25_top_in_hybrid = bm25_top_cn in merged_cn_list if bm25_top_cn else False
+    bm25_top_rank_in_hybrid = (merged_cn_list.index(bm25_top_cn) + 1) if is_bm25_top_in_hybrid else None
     
     return {
         "bm25_top_score": bm25_top_score,       # BM25 top 점수
         "bm25_exact_rank": bm25_exact_rank,     # BM25에서 정확 매칭 순위
         "bm25_exact_match": bm25_exact_match,   # BM25 정확 매칭 내용 {cn, ko}
-        "bm25_in_hybrid": bm25_in_hybrid,       # BM25 top이 merged에 있는지
-        "bm25_hybrid_rank": bm25_hybrid_rank,   # merged에서의 BM25 top 순위
+        "is_bm25_top_in_hybrid": is_bm25_top_in_hybrid,       # BM25 top이 merged에 있는지
+        "bm25_top_rank_in_hybrid": bm25_top_rank_in_hybrid,   # merged에서의 BM25 top 순위
     }

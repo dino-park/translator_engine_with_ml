@@ -17,7 +17,7 @@ class CompassEmbeddingModel(BaseEmbedding):
     Compass API전용 임베딩 모델 래퍼 클래스
     - compass-embedding-v4 사용
     - text-type 파라미터 지원 (document/query)
-    - Rate Limit 대응: Compass API는 30 RPM
+    - Rate Limit 대응: Compass API는 180 RPM
     - API 응답에서 정확한 토큰 수를 추적
     """
     
@@ -77,9 +77,9 @@ class CompassEmbeddingModel(BaseEmbedding):
                 if response.usage and response.usage.total_tokens:
                     self._total_tokens += response.usage.total_tokens
                 
-                # 인덱싱 시에만 Rate limit 방지 딜레이 적용 (30 RPM = 2초 간격)
+                # 인덱싱 시에만 Rate limit 방지 딜레이 적용 (180 RPM = 0.33초 간격)
                 if rate_limit_delay:
-                    time.sleep(2.5)
+                    time.sleep(0.5)
                 
                 return [d.embedding for d in response.data]
                 

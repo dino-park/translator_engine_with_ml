@@ -46,14 +46,14 @@ def preprocess_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     ]
     
     # 2. 선택적 feature (DB에 존재할 경우만 사용)
-    optional_cols = ["bm25_exact_rank", "bm25_hybrid_rank"]
+    optional_cols = ["bm25_exact_rank", "bm25_top_rank_in_hybrid"]
     for col in optional_cols:
         if col in df.columns:
             feature_cols.append(col)
     
     # 3. rank_diff 파생 feature (둘 다 있을 경우에만, hybrid와 BM25 순위 차이)
-    if "bm25_exact_rank" in df.columns and "bm25_hybrid_rank" in df.columns:
-        df["rank_diff"] = (df["bm25_hybrid_rank"].fillna(0) - df["bm25_exact_rank"].fillna(0))
+    if "bm25_exact_rank" in df.columns and "bm25_top_rank_in_hybrid" in df.columns:
+        df["rank_diff"] = (df["bm25_top_rank_in_hybrid"].fillna(0) - df["bm25_exact_rank"].fillna(0))
         feature_cols.append("rank_diff")
         
     if "top_doc_type" in df.columns:
@@ -63,7 +63,7 @@ def preprocess_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     # 4. 결측치 처리: 숫자는 0, bool은 0/1로    
     numeric_cols = [
         "query_len", "top_score", "candidate_gap",
-        "bm25_exact_rank", "bm25_hybrid_rank", "rank_diff"
+        "bm25_exact_rank", "bm25_top_rank_in_hybrid", "rank_diff"
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -118,6 +118,9 @@ def run_kmeans_clustering_from_db(k: int = 6, min_rows: int = 100) -> pd.DataFra
     X_scaled = scaler.fit_transform(X)
     
     # KMeans
+    # n_clusters: Cluster 그룹을 k개로 나눔(로그 패턴을 6개 유형으로 나눔)
+    # random_state: 랜덤 시드 고정(동일한 데이터에 대해 동일한 결과 보장)
+    # n_init: KMeans 알고리즘 반복 횟수(초기 클러스터 중심 초기화 방법을 10번 시도)
     model = KMeans(n_clusters=k, random_state=42, n_init=10)
     df["cluster"] = model.fit_predict(X_scaled)
     
@@ -138,7 +141,7 @@ def run_kmeans_clustering_from_db(k: int = 6, min_rows: int = 100) -> pd.DataFra
         print(df[df['cluster'] == c][show_cols].head(5))
         
     save_csv = Path(__file__).parent / "clustered_logs.csv"
-    df.to_csv(save_csv, index=False, encoding="utf-8")
+    df.to_csv(save_csv, index=False, encoding="utf-8-sig")
     print(f"\n클러스터 결과를 csv로 저장함: {save_csv}")
     return df
     

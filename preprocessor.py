@@ -30,6 +30,21 @@ _REMOVE_PATTERNS = re.compile(
 # ===============================================
 # 쿼리 전처리
 # ===============================================
+def normalize_special_symbols(text: str) -> str:
+    if not text:
+        return ""
+    
+    # ----- 특수기호 정규화 -----
+    # 브래킷류를 공백으로 치환(의미 구분 유지)
+    text = re.sub(r'[【】\[\]「」『』〈〉《》（）()]', ' ', text)
+    
+    # 콜론/세미콜론도 공백으로
+    text = re.sub(r'[：:；;]', ' ', text)
+    
+    # 연속 공백 정리
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
 
 def preprocess_query(query: str) -> str:
     """
@@ -38,6 +53,7 @@ def preprocess_query(query: str) -> str:
     1. 정규식으로 "번역해줘", "를 번역해주세요" 등 부탁 문구 제거
     2. 중국어(한자)가 있으면 가장 긴 한자 문자열 반환
     3. 한자 없으면 정리된 텍스트 반환
+    4. 특수기호 정규화 추가
     
     Args:
         query: 원본 쿼리
@@ -53,6 +69,9 @@ def preprocess_query(query: str) -> str:
         return ""
     
     text = query.strip()
+    
+    # 0. 특수기호 정규화 (선처리)
+    text = normalize_special_symbols(text)
     
     # 1. 부탁 문구 제거
     text = _REMOVE_PATTERNS.sub("", text).strip()
@@ -267,3 +286,23 @@ def extract_terms_from_sentence(sentence: str, min_len: int = 2, max_len: int = 
     # 긴 용어부터 정렬 (긴 용어가 더 구체적이므로 우선)
     return sorted(candidates, key=len, reverse=True)
 
+
+# ===== 입력 쿼리로부터 혼합 언어 감지 확인용 =====
+def detect_mixed_language(text: str) -> bool:
+    """
+    입력 텍스트에 한글과 중국어가 혼합되어 있는지 확인
+    
+    Args:
+        text: 검사할 텍스트
+    
+    Returns:
+        True if 한글과 중국어 혼합, False otherwise
+    """
+    ko_pattern = re.compile(r'[가-힣]+')             # 한글 패턴
+    cn_pattern = re.compile(r'[\u4e00-\u9fff]+')    # 중국어 패턴
+    
+    has_ko = bool(ko_pattern.search(text))
+    has_cn = bool(cn_pattern.search(text))
+    
+    # 둘다 포함되어 있으면 True 반환(혼합 언어)
+    return has_ko and has_cn

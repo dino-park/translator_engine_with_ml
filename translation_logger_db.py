@@ -48,7 +48,7 @@ class TranslationLoggerDB:
         - is_exact_match: 정확 매칭 여부 (가장 신뢰도 높음)
         - is_bm25_match: BM25(키워드)에서 매칭됨 (키워드 일치)
         - bm25_exact_rank: BM25에서 정확매칭 순위 (1이면 BM25도 1위)
-        - bm25_hybrid_rank: Hybrid에서의 순위 (Vector 영향 확인)
+        - bm25_top_rank_in_hybrid: Hybrid에서의 순위 (Vector 영향 확인)
         - is_llm_fallback: LLM으로 번역했는지 (용어사전에 없었음)
         - source: 요청 출처 (api/debug/batch)
         (추가함)
@@ -83,7 +83,7 @@ class TranslationLoggerDB:
                 
                 -- BM25 분석 정보 (Vector vs BM25 비교)
                 bm25_exact_rank INTEGER,
-                bm25_hybrid_rank INTEGER,
+                bm25_top_rank_in_hybrid INTEGER,
                 
                 -- segment/metadata 기반 feature
                 top_doc_type TEXT,
@@ -129,7 +129,7 @@ class TranslationLoggerDB:
         # BM25 분석 정보 추출
         bm25 = result.get("bm25_analysis") or {}
         bm25_exact_rank = bm25.get("bm25_exact_rank")
-        bm25_hybrid_rank = bm25.get("bm25_hybrid_rank")
+        bm25_top_rank_in_hybrid = bm25.get("bm25_top_rank_in_hybrid")
         
         # BM25에서 정확 매칭이 있으면 is_bm25_match = True
         if bm25_exact_rank is not None:
@@ -190,7 +190,7 @@ class TranslationLoggerDB:
             (query, query_len, src_lang, mode, translation, reason,
              top_score, candidate_gap, candidates_json,
              is_exact_match, is_bm25_match, is_llm_fallback,
-             bm25_exact_rank, bm25_hybrid_rank, 
+             bm25_exact_rank, bm25_top_rank_in_hybrid, 
              top_doc_type, is_segment_exact_match, segment_parent_cn,
              has_glossary_hints, glossary_match_count,
              passed_bm25_check, passed_gap_check, response_time_ms,
@@ -210,7 +210,7 @@ class TranslationLoggerDB:
             is_bm25_match,
             is_llm_fallback,
             bm25_exact_rank,
-            bm25_hybrid_rank,
+            bm25_top_rank_in_hybrid,
             top_doc_type,
             is_segment_exact_match,
             segment_parent_cn,
@@ -222,6 +222,123 @@ class TranslationLoggerDB:
             source
         ))
         self.conn.commit()
+    
+    
+    def log_translation_batch(self, results: list[dict], source: str = "api"):
+        """
+        번역 결과를 배치로 DB에 저장 (성능 최적화)
+        
+        Args:
+            results: translate_term() 또는 translate_sentence_with_glossary()의 반환값 리스트
+            source: 요청 출처 ("api", "debug", "batch")
+        """
+        if not results:
+            return
+        
+        # 배치 데이터 준비
+        batch_data = []
+    
+        for result in results:
+            # 후보 정보 추출
+            candidates = result.get("candidates", []) or []
+            top_score = candidates[0]["score"] if candidates else None
+            candidate_gap = (candidates[0]["score"] - candidates[1]["score"]) if len(candidates) > 1 else None
+            
+            # 매칭 유형 판단
+            reason = result.get("reason", "")
+            is_exact_match = "exact_match" in reason
+            is_bm25_match = False
+            is_llm_fallback = "llm" in reason.lower()
+            
+            # BM25 분석 정보 추출
+            bm25 = result.get("bm25_analysis") or {}
+            bm25_exact_rank = bm25.get("bm25_exact_rank")
+            bm25_top_rank_in_hybrid = bm25.get("bm25_top_rank_in_hybrid")
+            
+            if bm25_exact_rank is not None:
+                is_bm25_match = True
+                
+            # segment/metadata 기반 feature 계산
+            top_doc_type = ""
+            segment_parent_cn = ""
+            is_segment_exact_match = 0
+            
+            if candidates:
+                top = candidates[0]
+                metadata = top.get("metadata", {})
+                top_doc_type = metadata.get("doc_type", "") or top.get("matched_by", "") or ""
+                
+                segment_parent_cn = (
+                    metadata.get("parent_cn")
+                    or top.get("parent_cn")
+                    or top.get("segment_parent_cn")
+                    or ""
+                )
+                if top_doc_type == "cn_segment":
+                    normalized_query = normalize_for_exact_match(result.get("query", ""))
+                    top_cn_normalized = normalize_for_exact_match(top.get("cn", ""))
+                    if normalized_query and top_cn_normalized and normalized_query == top_cn_normalized:
+                        is_segment_exact_match = 1
+            
+            # glossary hints 관련
+            glossary_hints = result.get("glossary_hints")
+            has_glossary_hints = glossary_hints is not None
+            glossary_match_count = 0
+            if glossary_hints and isinstance(glossary_hints, dict):
+                matches = glossary_hints.get("matches", [])
+                glossary_match_count = len(matches)
+            
+            # 신뢰도 체크 관련
+            passed_bm25_check = result.get("passed_bm25_check")
+            passed_gap_check = result.get("passed_gap_check")
+            
+            # 성능 관련
+            response_time_ms = result.get("response_time_ms")
+            
+            # 튜플로 데이터 추가
+            batch_data.append((
+                result.get("query"),
+                len(result.get("query", "")),
+                result.get("src_lang"),
+                result.get("mode"),
+                result.get("translation"),
+                reason,
+                top_score,
+                candidate_gap,
+                json.dumps(candidates, ensure_ascii=False),
+                is_exact_match,
+                is_bm25_match,
+                is_llm_fallback,
+                bm25_exact_rank,
+                bm25_top_rank_in_hybrid,
+                top_doc_type,
+                is_segment_exact_match,
+                segment_parent_cn,
+                has_glossary_hints,
+                glossary_match_count,
+                passed_bm25_check,
+                passed_gap_check,
+                response_time_ms,
+                source
+            ))
+        
+        # 배치 INSERT 실행 (executemany 사용)
+        self.conn.executemany("""
+            INSERT INTO translation_logger 
+            (query, query_len, src_lang, mode, translation, reason,
+            top_score, candidate_gap, candidates_json,
+            is_exact_match, is_bm25_match, is_llm_fallback,
+            bm25_exact_rank, bm25_top_rank_in_hybrid, 
+            top_doc_type, is_segment_exact_match, segment_parent_cn,
+            has_glossary_hints, glossary_match_count,
+            passed_bm25_check, passed_gap_check, response_time_ms,
+            source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, batch_data)
+        
+        # 한번만 commit
+        self.conn.commit()
+    
     
     def get_all_logs(self) -> list[dict]:
         """

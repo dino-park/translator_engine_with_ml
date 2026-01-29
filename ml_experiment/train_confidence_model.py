@@ -85,7 +85,7 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     df = df.copy()
     
     # 숫자형 컬럼: 0으로 채움
-    for col in ["top_score", "candidate_gap", "bm25_exact_rank", "bm25_hybrid_rank"]:
+    for col in ["top_score", "candidate_gap", "bm25_exact_rank", "bm25_top_rank_in_hybrid"]:
         if col in df.columns:
             df[col] = df[col].fillna(0)
     
@@ -97,12 +97,12 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     # BM25 분석 피처 추가 (있으면)
     if "bm25_exact_rank" in df.columns:
         feature_columns.append("bm25_exact_rank")
-    if "bm25_hybrid_rank" in df.columns:
-        feature_columns.append("bm25_hybrid_rank")
+    if "bm25_top_rank_in_hybrid" in df.columns:
+        feature_columns.append("bm25_top_rank_in_hybrid")
     
     # 파생 피처: BM25와 Hybrid 순위 차이
-    if "bm25_exact_rank" in df.columns and "bm25_hybrid_rank" in df.columns:
-        df["rank_diff"] = (df["bm25_hybrid_rank"] - df["bm25_exact_rank"]).fillna(0)
+    if "bm25_exact_rank" in df.columns and "bm25_top_rank_in_hybrid" in df.columns:
+        df["rank_diff"] = (df["bm25_top_rank_in_hybrid"] - df["bm25_exact_rank"]).fillna(0)
         feature_columns.append("rank_diff")
     
     print(f"사용할 피처: {feature_columns}")
@@ -298,13 +298,13 @@ def predict_confidence(result: dict, model=None, scaler=None, feature_columns=No
         elif col == "bm25_exact_rank":
             bm25 = result.get("bm25_analysis") or {}
             features.append(bm25.get("bm25_exact_rank") or 0)
-        elif col == "bm25_hybrid_rank":
+        elif col == "bm25_top_rank_in_hybrid":
             bm25 = result.get("bm25_analysis") or {}
-            features.append(bm25.get("bm25_hybrid_rank") or 0)
+            features.append(bm25.get("bm25_top_rank_in_hybrid") or 0)
         elif col == "rank_diff":
             bm25 = result.get("bm25_analysis") or {}
             exact = bm25.get("bm25_exact_rank") or 0
-            hybrid = bm25.get("bm25_hybrid_rank") or 0
+            hybrid = bm25.get("bm25_top_rank_in_hybrid") or 0
             features.append(hybrid - exact)
         else:
             features.append(0)
@@ -388,7 +388,7 @@ def create_test_data() -> pd.DataFrame:
         "is_bm25_match": np.random.choice([True, False], n, p=[0.4, 0.6]),
         "is_llm_fallback": np.random.choice([True, False], n, p=[0.3, 0.7]),
         "bm25_exact_rank": np.random.choice([1, 2, 3, None], n),
-        "bm25_hybrid_rank": np.random.choice([1, 2, 3, 4, 5, None], n),
+        "bm25_top_rank_in_hybrid": np.random.choice([1, 2, 3, 4, 5, None], n),
     }
     
     return pd.DataFrame(data)

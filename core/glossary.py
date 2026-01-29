@@ -2,6 +2,9 @@
 # Glossary 관리(segment 부분 매칭용 포함)
 
 import jieba
+import glob
+import pandas as pd
+from pathlib import Path
 
 from core.init_document_node import load_dataset
 from core.normalizer import normalize_for_exact_match
@@ -16,11 +19,59 @@ logger = get_translator_logger("core.glossary")
 # Glossary Map 캐싱 (부분 매칭용)
 # -----------------------------
 
-BASE_CSV_PATH = "glossary/Fellowmoon 语言包1211_기본단어.csv"
+# Glossary 디렉토리 경로
+GLOSSARY_DIR = "glossary"
 
-def build_glossary_map(csv_path: str = None) -> dict[str, tuple[str, str]]:
+
+def _load_all_glossary_data() -> pd.DataFrame:
     """
-    CSV에서 glossary_map을 생성 (jieba로 segment도 포함)
+    Glossary 디렉토리의 모든 CSV 파일을 로드하여 병합
+    - indexing.py의 load_all_csvs_from_directory() 함수와 동일한 기능
+
+    Returns:
+        pd.DataFrame: 병합된 DataFrame
+    """
+    csv_files = sorted(glob.glob(f"{GLOSSARY_DIR}/*.csv"))
+    
+    if not csv_files:
+        logger.warning(f"No CSV files found in {GLOSSARY_DIR}")
+        return pd.DataFrame(columns=["cn", "ko"])
+    
+    logger.info(f"Loading {len(csv_files)} CSV files for glossary map")
+    
+    all_dfs = []
+    for csv_path in csv_files:
+        try:
+            df = load_dataset(csv_path)
+            all_dfs.append(df)
+            logger.info(f"  ✓ {Path(csv_path).name}: {len(df)} rows")
+        except Exception as e:
+            logger.error(f"   ✗ Failed to load {Path(csv_path).name}: {e}")
+    
+    if not all_dfs:
+        logger.warning("No valid CSV files loaded")
+        return pd.DataFrame(columns=["cn", "ko"])
+    
+    # 병합
+    merged = pd.concat(all_dfs, ignore_index=True)
+    before_count = len(merged)
+    # 중복 제거 (cn 기준, 첫 번째 항목 유지)
+    merged = merged.drop_duplicates(subset="cn", keep="first")
+    after_count = len(merged)
+    
+    
+    duplicates_removed = before_count - after_count
+    if duplicates_removed > 0:
+        logger.info(f"Removed {duplicates_removed} duplicate entries")
+        print(f"  → 중복 제거: {duplicates_removed:,}개")
+    
+    logger.info(f"Total glossary entries: {after_count}")
+    return merged
+    
+
+def build_glossary_map() -> dict[str, tuple[str, str]]:
+    """
+    모든 CSV에서 glossary_map을 생성 (jieba로 segment도 포함)
     
     - lookup_glossary_by_segments에서 사용
     - Document/Node 증가 없이 부분 매칭 지원
@@ -37,8 +88,8 @@ def build_glossary_map(csv_path: str = None) -> dict[str, tuple[str, str]]:
         원본 항목(is_segment=False)이 segment(is_segment=True)보다 항상 우선함.
         즉, 荔倾이 원본으로 등록되면, 荔倾的门匙에서 추출한 segment는 덮어쓰지 않음.
     """
-    csv_path = csv_path or BASE_CSV_PATH
-    df = load_dataset(csv_path)
+    
+    df = _load_all_glossary_data()
     
     glossary_map: dict[str, tuple[str, str, bool]] = {}
     
@@ -77,20 +128,19 @@ def build_glossary_map(csv_path: str = None) -> dict[str, tuple[str, str]]:
                 # segment의 ko는 parent의 ko (LLM이 문맥 판단)
                 glossary_map[normalized_seg] = (seg, ko, True)
     
-    logger.info("Glossary map built from CSV: %d entries (including segments)", len(glossary_map))
+    logger.info("Glossary map built: %d entries (including segments)", len(glossary_map))
     return glossary_map
 
 
-def build_glossary_map_ko(csv_path: str = None) -> dict[str, tuple[str, str]]:
+def build_glossary_map_ko() -> dict[str, tuple[str, str]]:
     """
     한국어 기준 glossary_map 생성 (역방향 lookup 용도)
-    Args:
-        csv_path (str, optional): glossary CSV 파일 경로 (기본: BASE_CSV_PATH)
+    
     Returns:
         {normalized_ko: (원본_ko, cn)} 딕셔너리
     """
-    csv_path = csv_path or BASE_CSV_PATH
-    df = load_dataset(csv_path)
+    
+    df = _load_all_glossary_data()
     
     glossary_map_ko: dict[str, tuple[str, str, bool]] = {}
     
