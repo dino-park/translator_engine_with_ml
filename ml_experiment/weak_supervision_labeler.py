@@ -82,6 +82,25 @@ def lf_strong_bad_bm25_hybrid_conflict(row) -> int:
     
     return ABSTAIN
 
+# 해당 규칙은 ABSTAIN 감소 효과 목적으로 추가되었으며, 이후 지속적으로 사용할 것인지 판단 필요
+def lf_good_rank1_with_exact(row) -> int:
+    """
+    규칙 3.5: Rank 1위이며, Exact match가 있으면 GOOD
+    
+    조건: 
+    - is_exact_match == 1
+    - bm25_top_rank_in_hybrid == 1
+    
+    이유: 
+    - 정확한 매칭이 1위로 선택됨 = 가장 신뢰할 수 있는 Case
+    - LLM fallback이어도 최종 선택은 exact match 기반
+    """
+    if (_get_row(row, TF.IS_EXACT_MATCH, 0) == 1 and
+        _get_row(row, TF.BM25_TOP_RANK_IN_HYBRID) == 1):
+        return GOOD
+    
+    return ABSTAIN
+
 
 def lf_rank_mismatch_problem(row) -> int:
     """
@@ -259,6 +278,7 @@ CORE_LABELING_FUNCTIONS = [
     lf_strong_good_exact_bm25_no_llm,           # 가장 이상적
     lf_strong_good_segment_exact,               # exact + rank 1
     lf_strong_bad_bm25_hybrid_conflict,         # 개선 필요
+    lf_good_rank1_with_exact,                   # rank 1 + exact 매칭
     lf_rank_mismatch_problem,                   # rank 불일치 큼
     lf_strong_bad_low_score_and_llm,            # segment 문제
     lf_top_segment_but_rank_low,         # 이상한 조합
@@ -457,6 +477,13 @@ def generate_weak_labels(df: pd.DataFrame, use_weighted_vote: bool = True) -> pd
         df = generate_weak_labels(df, use_weighted_vote=True)
         print(df[['query', 'translation', 'weak_label']].head())
     """
+    # 0. 파생 features 생성 (DB에 없는 것들)
+    # is_top_segment: top_doc_type이 "cn_segment"이면 1
+    if TF.TOP_DOC_TYPE in df.columns:
+        df[TF.IS_TOP_SEGMENT] = (df[TF.TOP_DOC_TYPE] == "cn_segment").astype(int)
+    else:
+        df[TF.IS_TOP_SEGMENT] = 0
+    
     # 1. 모든 Labeling Function 적용
     df = apply_labeling_functions(df)
     

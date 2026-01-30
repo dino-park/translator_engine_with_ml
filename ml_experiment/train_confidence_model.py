@@ -32,6 +32,9 @@ import joblib  # 모델 저장용
 # Weak Supervision 레이블러 임포트
 from weak_supervision_labeler import generate_weak_labels, GOOD, BAD, ABSTAIN
 
+# Config에서 feature 정의 임포트
+from core.config import TranslationFeatures, ML_FEATURE_COLUMNS, ML_OPTIONAL_FEATURES
+
 
 # ============================================================
 # 1단계: 데이터 로드
@@ -71,41 +74,42 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     Returns:
         (피처가 정리된 DataFrame, 피처 컬럼 이름 리스트)
     """
-    # 사용할 피처들
-    feature_columns = [
-        "query_len",        # 쿼리 길이
-        "top_score",        # 검색 1위 점수
-        "candidate_gap",    # 1위-2위 점수 차이
-        "is_exact_match",   # 정확 매칭 여부
-        "is_bm25_match",    # BM25 매칭 여부
-        "is_llm_fallback",  # LLM fallback 여부
-    ]
-    
-    # 결측치 처리
     df = df.copy()
     
-    # 숫자형 컬럼: 0으로 채움
-    for col in ["top_score", "candidate_gap", "bm25_exact_rank", "bm25_top_rank_in_hybrid"]:
+    # config.py에서 정의한 feature 리스트 사용
+    feature_columns = ML_FEATURE_COLUMNS.copy()
+    
+    # Boolean 컬럼을 int로 변환 (ML 모델용)
+    bool_features = [
+        TranslationFeatures.IS_EXACT_MATCH,
+        TranslationFeatures.IS_BM25_MATCH,
+        TranslationFeatures.IS_LLM_FALLBACK,
+        TranslationFeatures.IS_SEGMENT_EXACT_MATCH,
+        TranslationFeatures.IS_TOP_SEGMENT,
+    ]
+    for col in bool_features:
         if col in df.columns:
-            df[col] = df[col].fillna(0)
+            df[col] = df[col].astype(int)
     
-    # Boolean 컬럼: False로 채움
-    for col in ["is_exact_match", "is_bm25_match", "is_llm_fallback"]:
-        if col in df.columns:
-            df[col] = df[col].fillna(False).astype(int)
-    
-    # BM25 분석 피처 추가 (있으면)
-    if "bm25_exact_rank" in df.columns:
-        feature_columns.append("bm25_exact_rank")
-    if "bm25_top_rank_in_hybrid" in df.columns:
-        feature_columns.append("bm25_top_rank_in_hybrid")
-    
-    # 파생 피처: BM25와 Hybrid 순위 차이
-    if "bm25_exact_rank" in df.columns and "bm25_top_rank_in_hybrid" in df.columns:
-        df["rank_diff"] = (df["bm25_top_rank_in_hybrid"] - df["bm25_exact_rank"]).fillna(0)
-        feature_columns.append("rank_diff")
+    # Optional features 추가 (데이터에 있으면)
+    for col in ML_OPTIONAL_FEATURES:
+        if col == TranslationFeatures.RANK_DIFF:
+            # 파생 피처: BM25와 Hybrid 순위 차이
+            bm25_exact = TranslationFeatures.BM25_EXACT_RANK
+            bm25_hybrid = TranslationFeatures.BM25_TOP_RANK_IN_HYBRID
+            
+            if bm25_exact in df.columns and bm25_hybrid in df.columns:
+                df[col] = df[bm25_hybrid] - df[bm25_exact]
+                df[col] = df[col].fillna(0)  # 순위 차이가 없으면 0
+                feature_columns.append(col)
+        elif col in df.columns:
+            # 기존 optional feature
+            feature_columns.append(col)
     
     print(f"사용할 피처: {feature_columns}")
+    print(f"  - 기본 피처: {len(ML_FEATURE_COLUMNS)}개")
+    print(f"  - 추가 피처: {len(feature_columns) - len(ML_FEATURE_COLUMNS)}개")
+    
     return df, feature_columns
 
 
@@ -276,35 +280,47 @@ def predict_confidence(result: dict, model=None, scaler=None, feature_columns=No
     if model is None:
         model, scaler, feature_columns = load_model()
     
-    # 피처 추출
+    # 피처 추출 (TranslationFeatures 사용)
     features = []
     for col in feature_columns:
-        if col == "query_len":
-            features.append(len(result.get("query", "")))
-        elif col == "top_score":
-            candidates = result.get("candidates", [])
+        if col == TranslationFeatures.QUERY_LEN:
+            features.append(len(result.get(TranslationFeatures.QUERY, "")))
+        elif col == TranslationFeatures.TOP_SCORE:
+            candidates = result.get(TranslationFeatures.CANDIDATES, [])
             features.append(candidates[0]["score"] if candidates else 0)
-        elif col == "candidate_gap":
-            candidates = result.get("candidates", [])
+        elif col == TranslationFeatures.CANDIDATE_GAP:
+            candidates = result.get(TranslationFeatures.CANDIDATES, [])
             gap = (candidates[0]["score"] - candidates[1]["score"]) if len(candidates) > 1 else 0
             features.append(gap)
-        elif col == "is_exact_match":
-            features.append(1 if "exact_match" in result.get("reason", "") else 0)
-        elif col == "is_bm25_match":
-            bm25 = result.get("bm25_analysis") or {}
-            features.append(1 if bm25.get("bm25_exact_rank") else 0)
-        elif col == "is_llm_fallback":
-            features.append(1 if "llm" in result.get("reason", "").lower() else 0)
-        elif col == "bm25_exact_rank":
-            bm25 = result.get("bm25_analysis") or {}
-            features.append(bm25.get("bm25_exact_rank") or 0)
-        elif col == "bm25_top_rank_in_hybrid":
-            bm25 = result.get("bm25_analysis") or {}
-            features.append(bm25.get("bm25_top_rank_in_hybrid") or 0)
-        elif col == "rank_diff":
-            bm25 = result.get("bm25_analysis") or {}
-            exact = bm25.get("bm25_exact_rank") or 0
-            hybrid = bm25.get("bm25_top_rank_in_hybrid") or 0
+        elif col == TranslationFeatures.IS_EXACT_MATCH:
+            features.append(1 if "exact_match" in result.get(TranslationFeatures.REASON, "") else 0)
+        elif col == TranslationFeatures.IS_BM25_MATCH:
+            bm25 = result.get(TranslationFeatures.BM25_ANALYSIS) or {}
+            features.append(1 if bm25.get(TranslationFeatures.BM25_EXACT_RANK) else 0)
+        elif col == TranslationFeatures.IS_LLM_FALLBACK:
+            features.append(1 if "llm" in result.get(TranslationFeatures.REASON, "").lower() else 0)
+        elif col == TranslationFeatures.IS_SEGMENT_EXACT_MATCH:
+            # DB에 저장되어 있거나, result에 직접 포함될 수 있음
+            features.append(result.get(TranslationFeatures.IS_SEGMENT_EXACT_MATCH, 0))
+        elif col == TranslationFeatures.IS_TOP_SEGMENT:
+            # top_doc_type이 "cn_segment"이면 1
+            candidates = result.get(TranslationFeatures.CANDIDATES, [])
+            if candidates:
+                top_metadata = candidates[0].get("metadata", {})
+                top_doc_type = top_metadata.get("doc_type", "")
+                features.append(1 if top_doc_type == "cn_segment" else 0)
+            else:
+                features.append(0)
+        elif col == TranslationFeatures.BM25_EXACT_RANK:
+            bm25 = result.get(TranslationFeatures.BM25_ANALYSIS) or {}
+            features.append(bm25.get(TranslationFeatures.BM25_EXACT_RANK) or 0)
+        elif col == TranslationFeatures.BM25_TOP_RANK_IN_HYBRID:
+            bm25 = result.get(TranslationFeatures.BM25_ANALYSIS) or {}
+            features.append(bm25.get(TranslationFeatures.BM25_TOP_RANK_IN_HYBRID) or 0)
+        elif col == TranslationFeatures.RANK_DIFF:
+            bm25 = result.get(TranslationFeatures.BM25_ANALYSIS) or {}
+            exact = bm25.get(TranslationFeatures.BM25_EXACT_RANK) or 0
+            hybrid = bm25.get(TranslationFeatures.BM25_TOP_RANK_IN_HYBRID) or 0
             features.append(hybrid - exact)
         else:
             features.append(0)
@@ -380,15 +396,17 @@ def create_test_data() -> pd.DataFrame:
     n = 100  # 샘플 수
     
     data = {
-        "query": [f"테스트용어{i}" for i in range(n)],
-        "query_len": np.random.randint(2, 15, n),
-        "top_score": np.random.uniform(0, 1, n),
-        "candidate_gap": np.random.uniform(0, 0.3, n),
-        "is_exact_match": np.random.choice([True, False], n, p=[0.3, 0.7]),
-        "is_bm25_match": np.random.choice([True, False], n, p=[0.4, 0.6]),
-        "is_llm_fallback": np.random.choice([True, False], n, p=[0.3, 0.7]),
-        "bm25_exact_rank": np.random.choice([1, 2, 3, None], n),
-        "bm25_top_rank_in_hybrid": np.random.choice([1, 2, 3, 4, 5, None], n),
+        TranslationFeatures.QUERY: [f"테스트용어{i}" for i in range(n)],
+        TranslationFeatures.QUERY_LEN: np.random.randint(2, 15, n),
+        TranslationFeatures.TOP_SCORE: np.random.uniform(0, 1, n),
+        TranslationFeatures.CANDIDATE_GAP: np.random.uniform(0, 0.3, n),
+        TranslationFeatures.IS_EXACT_MATCH: np.random.choice([True, False], n, p=[0.3, 0.7]),
+        TranslationFeatures.IS_BM25_MATCH: np.random.choice([True, False], n, p=[0.4, 0.6]),
+        TranslationFeatures.IS_LLM_FALLBACK: np.random.choice([True, False], n, p=[0.3, 0.7]),
+        TranslationFeatures.IS_SEGMENT_EXACT_MATCH: np.random.choice([True, False], n, p=[0.2, 0.8]),
+        TranslationFeatures.IS_TOP_SEGMENT: np.random.choice([True, False], n, p=[0.15, 0.85]),
+        TranslationFeatures.BM25_EXACT_RANK: np.random.choice([1, 2, 3, None], n),
+        TranslationFeatures.BM25_TOP_RANK_IN_HYBRID: np.random.choice([1, 2, 3, 4, 5, None], n),
     }
     
     return pd.DataFrame(data)

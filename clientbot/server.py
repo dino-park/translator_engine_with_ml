@@ -205,28 +205,38 @@ async def process_group_message(group_id: str, user_text: str, message_id: str, 
             if is_date_or_version_pattern(user_text):
                 logger.info(f"[Group] Skipping translation: date/version pattern detected - %r", user_text)
                 reply_text = f"📝 번역 결과:\n{user_text}"
+                await seatalk_client.send_group_text_message(group_id, reply_text, message_id, thread_id)
+                
             else:
                 logger.info(f"[Group] No Google Sheets URL detected, calling translation engine")
                 try:
                     result = translate_execute(user_text)
                     translation = result.get("translation")
                     
-                    # ----- 번역 로그 저장 (ML 학습용) -----
-                    translation_logger_db.log_translation(result, source="api")
-                    
                     if translation:
-                        reply_text = f"📝 번역 결과:\n{translation}"
+                        response = await seatalk_client.send_group_message(
+                            group_id,
+                            reply_text = f"📝 번역 결과:\n{translation}",
+                            message_id=message_id,
+                            thread_id=thread_id
+                        )
+                        sent_message_id = response.get("message_id")
+                        # ----- 번역 로그 저장 (ML 학습용) -----
+                        translation_logger_db.log_translation(result, source="api", chat_message_id=sent_message_id)
+
                     else:
                         reason = result.get("reason", "unknown")
                         reply_text = f"❌ 번역할 수 없습니다. (사유: {reason})"
+                        await seatalk_client.send_group_text_message(group_id, reply_text, message_id, thread_id)
                 except Exception as e:
                     logger.error(f"[Group] Translation error: {e}")
                     reply_text = f"⚠️ 번역 중 오류가 발생했습니다: {str(e)}"
+                    await seatalk_client.send_group_text_message(group_id, reply_text, message_id, thread_id)
         else:
             reply_text = ("💡번역할 텍스트를 입력해주세요.\n\n"
                           "또는 Google Sheets URL + Range를 입력하시면 문서 번역을 시작합니다.\n"
                           "e.g. https://docs.google.com/.../d/xxx Sheet1!A2:A100")
-        await seatalk_client.send_group_text_message(group_id, reply_text, message_id, thread_id)
+            await seatalk_client.send_group_text_message(group_id, reply_text, message_id, thread_id)
     
     logger.info(f"[Group] Processed: group_id={group_id}, message_id={message_id}")
 
@@ -278,9 +288,9 @@ async def process_single_message(employee_code: str, user_text: str, message_id:
             f"📌 범위와 출력 열을 함께 입력해주세요:\n"
             f"e.g. {sheet_url} Sheet1!A2:A100 C🔻"
         )
-        await seatalk_client.send_text_message(employee_code, reply_text)
+        await seatalk_client.send_card_message(employee_code, reply_text)
         
-    # case 3: 일반 번역
+    # case 4: 일반 번역
     else:
         if user_text.strip():
             # 날짜/버전 패턴 체크 (번역 스킵)
@@ -293,24 +303,31 @@ async def process_single_message(employee_code: str, user_text: str, message_id:
                     result = translate_execute(user_text)
                     translation = result.get("translation")
                     
-                    # ----- 번역 로그 저장 (ML 학습용) -----
-                    translation_logger_db.log_translation(result, source="api")
-                    
                     if translation:
-                        reply_text = f"📝 번역 결과:\n{translation}"
+                        response = await seatalk_client.send_card_message(
+                            employee_code,
+                            reply_text = f"📝 번역 결과:\n{translation}"
+                        )
+                        # response에서 message_id 추출 (응답 구조: {'code': 0, 'message_id': '...'})
+                        sent_message_id = response.get("message_id")
+                        
+                        # ----- 번역 로그 저장 (ML 학습용) -----
+                        translation_logger_db.log_translation(result, source="api", chat_message_id=sent_message_id)
                     else:
                         reason = result.get("reason", "unknown")
                         reply_text = f"❌ 번역할 수 없습니다. (사유: {reason})"
+                        await seatalk_client.send_text_message(employee_code, reply_text)
                 except Exception as e:
                     logger.error(f"Translation error: {e}")
                     reply_text = f"⚠️ 번역 중 오류가 발생했습니다: {str(e)}"
+                    await seatalk_client.send_text_message(employee_code, reply_text)
         else:
             reply_text = (
                 "💡 번역할 텍스트를 입력해주세요.\n\n"
                 "또는 Google Sheets URL + Range를 입력하시면 문서 번역을 시작합니다.\n"
                 "e.g. https://docs.google.com/.../d/xxx Sheet1!A2:A100"
             )
-        await seatalk_client.send_text_message(employee_code, reply_text)
+            await seatalk_client.send_text_message(employee_code, reply_text)
     
     logger.info(f"[Single] Processed: employee_code={employee_code}, message_id={message_id}")
 
@@ -381,5 +398,69 @@ async def webhook(request: Request, background_tasks: BackgroundTasks, signature
         # 백그라운드에서 처리하고 즉시 응답 반환 (SeaTalk 타임아웃 방지)
         background_tasks.add_task(process_group_message, group_id, user_text, message_id, thread_id)
         logger.info(f"[Group] Queued: group_id={group_id}, message_id={message_id}, thread_id={thread_id}")
+    
+    # ----- Interactive message의 callback button 이벤트 처리 -----        
+    elif event_type == "interactive_message_click":
+        
+        message_id = event.get("message_id")
+        feedback_value = event.get("value")
+        employee_code = event.get("employee_code")
+        group_id = event.get("group_id")
+        thread_id = event.get("thread_id")
+        
+        # single chat인지 group chat인지 구분
+        is_group_chat = bool(group_id)          # True: group chat, False: single chat
+        
+        logger.info(f"[Feedback] message_id={message_id}, feedback_value={feedback_value}, employee={employee_code}, is_group_chat={is_group_chat}")
+        
+        # ----- 사용자 피드백 DB저장 (ML 학습용) -----
+        success, status= translation_logger_db.update_user_feedback(message_id, feedback_value)
+        
+        if success and status == "feedback_updated":
+            logger.info(f"[Feedback] ✅ DB 업데이트 성공: message_id={message_id}, feedback={feedback_value}")
+            # 사용자에게 피드백 성공 메시지 전송
+            reply_text = f"🫶감사합니다! ({feedback_value}) 열심히 할게요.😊"
+            if is_group_chat:
+                # Group chat: send_group_text_message() 사용
+                await seatalk_client.send_group_text_message(
+                    group_id,
+                    reply_text,
+                    message_id,
+                    thread_id
+                )
+            else:
+                # Single chat: send_text_message() 사용
+                await seatalk_client.send_text_message(employee_code, reply_text)
+        
+        elif success and status == "feedback_already_exists":
+            logger.info(f"[Feedback] ⚠️ 이미 피드백이 제출되었습니다: message_id={message_id}, feedback={feedback_value}")
+            # 사용자에게 이미 피드백이 제출되었다는 메시지 전송
+            reply_text = f"이미 피드백을 제출하셨습니다. 평가는 한 번만 가능해요.😊"
+            if is_group_chat:
+                await seatalk_client.send_group_text_message(
+                    group_id,
+                    reply_text,
+                    message_id,
+                    thread_id
+                )
+            else:
+                await seatalk_client.send_text_message(employee_code, reply_text)
+                
+        elif not success and status == "feedback_update_failed":
+            logger.warning(f"[Feedback] ⚠️ DB 업데이트 실패 - message_id를 찾을 수 없음: {message_id}")
+            # 사용자에게 피드백 실패 메시지 전송
+            reply_text = f"피드백 제출 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.😊"
+            if is_group_chat:
+                await seatalk_client.send_group_text_message(
+                    group_id,
+                    reply_text,
+                    message_id,
+                    thread_id
+                )
+            else:
+                await seatalk_client.send_text_message(employee_code, reply_text)
+
+        else:
+            logger.error(f"[Feedback] ⚠️ DB 업데이트 오류 - status={status}, message_id={message_id}")
     
     return JSONResponse({"received": True}, status_code=200)

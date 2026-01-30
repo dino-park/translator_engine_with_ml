@@ -128,6 +128,30 @@ class TranslationFeatures:
     CREATED_AT = "created_at"                   # 생성 시간
 
 
+# ===============================================
+# ML Model Features
+# - 신뢰도 예측 모델(train_confidence_model.py)에서 사용할 feature 목록
+# - 순서가 중요하므로 list로 관리
+# ===============================================
+ML_FEATURE_COLUMNS = [
+    TranslationFeatures.QUERY_LEN,              # 쿼리 길이
+    TranslationFeatures.TOP_SCORE,              # 검색 1위 점수
+    TranslationFeatures.CANDIDATE_GAP,          # 1위-2위 점수 차이
+    TranslationFeatures.IS_EXACT_MATCH,         # 정확 매칭 여부
+    TranslationFeatures.IS_BM25_MATCH,          # BM25 매칭 여부
+    TranslationFeatures.IS_LLM_FALLBACK,        # LLM fallback 여부
+    TranslationFeatures.IS_SEGMENT_EXACT_MATCH, # Segment 정확 매칭 여부 (weak supervision 규칙 2)
+    TranslationFeatures.IS_TOP_SEGMENT,         # 1위가 segment인지 (weak supervision 규칙 6)
+]
+
+# Optional features (데이터에 있으면 추가)
+ML_OPTIONAL_FEATURES = [
+    TranslationFeatures.BM25_EXACT_RANK,          # BM25 정확 매칭 순위
+    TranslationFeatures.BM25_TOP_RANK_IN_HYBRID,  # BM25 1등이 Hybrid에서 몇 등인지
+    TranslationFeatures.RANK_DIFF,                # 파생 피처: BM25 순위 차이
+]
+
+
 def load_env():
     """
     .env 파일에서 환경변수 로드

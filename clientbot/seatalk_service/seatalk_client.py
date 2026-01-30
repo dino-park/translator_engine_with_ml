@@ -45,7 +45,7 @@ class SeaTalkClient:
     
     async def send_card_message(self, e_code: str, reply_text: str = None):
         """
-        1:1 Single chat에 카드 형태 메시지 전송 (Google Sheet URL 감지 시)
+        1:1 Single chat에 카드 형태 메시지 전송
 
         Args:
             e_code (str): callback으로 전송된 employee_code
@@ -66,7 +66,7 @@ class SeaTalkClient:
                         {
                             "element_type": "title",
                             "title": {
-                                "text": "문서 번역 지원 Bot 입니다."
+                                "text": "GATE Engine Bot 입니다."
                             }
                         },
                         {
@@ -74,22 +74,23 @@ class SeaTalkClient:
                             "description": {
                                 "format": 1,
                                 "text": 
-                                    f"## Guide\n- 아래 버튼 클릭 시, 번역Web App으로 이동합니다.\n{reply_text or ''}\n\n## 참고사항\n1. word, excel, pdf, pdf만 가능\n2. 가급적 Text위주로 된 문서를 번역\n3. 50Mb이하의 문서만 가능\n4. 이미지 및 표 안의 text는 현재 번역이 불완전할 수 있음"
+                                    f"{reply_text or ''}\n\n⭐번역결과가 마음에 드신다면 'GOOD'을, 개선이 필요하다면 'BAD'를 눌러주세요⭐\n사용자의 피드백이 많아야 엔진학습에 도움이 됩니다.😊"
                             }
                         },
                         {
                             "element_type": "button",
                             "button": {
-                                "button_type": "redirect",
-                                "text": "문서번역 페이지로 이동",
-                                "mobile_link": {
-                                    "type": "web",
-                                    "path": "https://ai.insea.io/app/chatflows/9482"
-                                },
-                                "desktop_link": {
-                                    "type": "web",
-                                    "path": "https://ai.insea.io/app/chatflows/9482"
-                                }
+                                "button_type": "callback",
+                                "text": "👍GOOD",
+                                "value": "GOOD",
+                            }
+                        },
+                        {
+                            "element_type": "button",
+                            "button": {
+                                "button_type": "callback",
+                                "text": "👎BAD",
+                                "value": "BAD",
                             }
                         }
                     ]
@@ -103,18 +104,6 @@ class SeaTalkClient:
             body = res.json()
             logging.info(f"[SeaTalk] Card Message Response: {body}")
             return body
-    
-    async def send_message(self, e_code: str, reply_text: str = None):
-        """
-        1:1 Single chat 전송 (기존 호환용 - send_card_message로 위임)
-
-        Args:
-            e_code (str): callback으로 전송된 emplaoyee_code
-
-        Returns:
-            dict : client.post로 message를 보낸 후의 json을 python dict로 반환
-        """
-        return await self.send_card_message(e_code, reply_text)
     
     
     async def send_group_text_message(self, group_id: str, text: str, message_id: str = None, thread_id: str = None):
@@ -153,7 +142,7 @@ class SeaTalkClient:
             logging.info(f"[SeaTalk] Group Text Message Response: {body}")
             return body
     
-    async def send_group_message(self, group_id: str, message_id: str = None, thread_id: str = None):
+    async def send_group_message(self, group_id: str, reply_text: str, message_id: str = None, thread_id: str = None):
         """
         그룹 채팅방에 카드 형태 메시지 전송
 
@@ -184,22 +173,23 @@ class SeaTalkClient:
                                 "description": {
                                     "format": 1,
                                     "text": 
-                                        "## Guide\n- 아래 버튼 클릭 시, 요청하신 Google Sheets로 이동합니다."
+                                        f"{reply_text or ''}\n\n⭐번역결과가 마음에 드신다면 'GOOD'을, 개선이 필요하다면 'BAD'를 눌러주세요⭐\n사용자의 피드백이 많아야 엔진학습에 도움이 됩니다.😊"
                                 }
                             },
                             {
                                 "element_type": "button",
                                 "button": {
-                                    "button_type": "redirect",
-                                    "text": "페이지로 이동",
-                                    "mobile_link": {
-                                        "type": "web",
-                                        "path": "https://www.google.com/"
-                                    },
-                                    "desktop_link": {
-                                        "type": "web",
-                                        "path": "https://www.google.com/"
-                                    }
+                                    "button_type": "callback",
+                                    "text": "👍GOOD",
+                                    "value": "GOOD",
+                                }
+                            },
+                            {
+                                "element_type": "button",
+                                "button": {
+                                    "button_type": "callback",
+                                    "text": "👎BAD",
+                                    "value": "BAD",
                                 }
                             }
                         ]
@@ -224,7 +214,7 @@ class SeaTalkClient:
                             {
                                 "element_type": "title",
                                 "title": {
-                                    "text": "문서 번역 지원 Bot 입니다."
+                                    "text": "GATE Engine Bot 입니다."
                                 }
                             },
                             {
@@ -232,24 +222,25 @@ class SeaTalkClient:
                                 "description": {
                                     "format": 1,
                                     "text": 
-                                        "## Guide\n- 아래 버튼 클릭 시, 번역Web App으로 이동합니다.\n\n## 참고사항\n1. word, excel, pdf, pdf만 가능\n2. 가급적 Text위주로 된 문서를 번역\n3. 50Mb이하의 문서만 가능\n4. 이미지 및 표 안의 text는 현재 번역이 불완전할 수 있음"
+                                        f"{reply_text or ''}\n\n⭐번역결과가 마음에 드신다면 'GOOD'을, 개선이 필요하다면 'BAD'를 눌러주세요⭐\n사용자의 피드백이 많아야 엔진학습에 도움이 됩니다.😊"
                                 }
                             },
                             {
                                 "element_type": "button",
                                 "button": {
-                                    "button_type": "redirect",
-                                    "text": "문서번역 페이지로 이동",
-                                    "mobile_link": {
-                                        "type": "web",
-                                        "path": "https://ai.insea.io/app/chatflows/9482"
-                                    },
-                                    "desktop_link": {
-                                        "type": "web",
-                                        "path": "https://ai.insea.io/app/chatflows/9482"
-                                    }
+                                    "button_type": "callback",
+                                    "text": "👍GOOD",
+                                    "value": "GOOD",
                                 }
-                            }
+                            },
+                            {
+                                "element_type": "button",
+                                "button": {
+                                    "button_type": "callback",
+                                    "text": "👎BAD",
+                                    "value": "BAD",
+                                }
+                            },
                         ]
                     },
                     "thread_id": thread_id

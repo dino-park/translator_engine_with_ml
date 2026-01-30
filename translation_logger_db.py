@@ -45,6 +45,7 @@ class TranslationLoggerDB:
         - reason: 번역 방식 (exact_match, llm_fallback 등)
         - top_score: 검색 1위 점수 (높을수록 매칭 신뢰도 높음)
         - candidate_gap: 1위-2위 점수 차이 (클수록 확실한 매칭)
+        - candidates_json: 검색 결과 후보 정보 (json)
         - is_exact_match: 정확 매칭 여부 (가장 신뢰도 높음)
         - is_bm25_match: BM25(키워드)에서 매칭됨 (키워드 일치)
         - bm25_exact_rank: BM25에서 정확매칭 순위 (1이면 BM25도 1위)
@@ -55,6 +56,14 @@ class TranslationLoggerDB:
         - top_doc_type: top candidate가 어떤 타입인지(cn/cn_segment/cn_normalized/ko 등)
         - is_segment_exact_match: top candidate가 cn_segment인 경우, 정확 매칭 여부
         - segment_parent_cn: top candidate가 cn_segment인 경우 원문(parent_cn)
+        - has_glossary_hints: 용어사전 힌트 존재 여부
+        - glossary_match_count: 용어사전 매칭 개수
+        - passed_bm25_check: BM25 신뢰도 체크 통과 여부
+        - passed_gap_check: Candidate gap 체크 통과 여부
+        - user_feedback: 사용자 피드백 (GOOD/BAD)
+        - chat_message_id: Bot chat message id (피드백 추적용)
+        - response_time_ms: 번역 처리 시간 (ms)
+        - source: 요청 출처 (api/debug/batch)
         """
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS translation_logger (
@@ -98,6 +107,10 @@ class TranslationLoggerDB:
                 passed_bm25_check BOOLEAN,
                 passed_gap_check BOOLEAN,
                 
+                -- 사용자 피드백 관련
+                user_feedback TEXT,
+                chat_message_id TEXT,
+                
                 -- 성능 관련
                 response_time_ms INTEGER,
                 
@@ -107,13 +120,14 @@ class TranslationLoggerDB:
         """)
         self.conn.commit()
     
-    def log_translation(self, result: dict, source: str = "api"):
+    def log_translation(self, result: dict, source: str = "api", chat_message_id: str = None):
         """
         번역 결과를 DB에 저장
         
         Args:
             result: translate_term() 또는 translate_sentence_with_glossary()의 반환값
             source: 요청 출처 ("api", "debug", "batch")
+            chat_message_id: seatalk 메시지 ID (피드백 추적용, 선택사항)
         """
         # 후보 정보 추출
         candidates = result.get("candidates", []) or []
@@ -184,6 +198,11 @@ class TranslationLoggerDB:
         # ========================
         response_time_ms = result.get("response_time_ms")
         
+        # ========================
+        # 사용자 피드백 관련 (초기값 None)
+        # ========================
+        user_feedback = None  # 번역 저장 시점에는 아직 피드백 없음
+        
         # DB에 저장
         self.conn.execute("""
             INSERT INTO translation_logger 
@@ -194,8 +213,8 @@ class TranslationLoggerDB:
              top_doc_type, is_segment_exact_match, segment_parent_cn,
              has_glossary_hints, glossary_match_count,
              passed_bm25_check, passed_gap_check, response_time_ms,
-             source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             source, user_feedback, chat_message_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             result.get("query"),
             len(result.get("query", "")),
@@ -219,10 +238,45 @@ class TranslationLoggerDB:
             passed_bm25_check,
             passed_gap_check,
             response_time_ms,
-            source
+            source,
+            user_feedback,
+            chat_message_id
         ))
         self.conn.commit()
     
+    
+    def update_user_feedback(self, chat_message_id: str, feedback_value: str):
+        try:
+            # 먼저 해당 message_id가 존재하고 피드백이 있는지 확인
+            cursor = self.conn.execute("""
+                                       SELECT user_feedback
+                                       FROM translation_logger
+                                       WHERE chat_message_id = ?
+                                       """, (chat_message_id,))
+            result = cursor.fetchone()
+            # message_id를 찾을 수 없음
+            if result is None:
+                return (False, "message_id_not_found")
+            
+            if result[0] is not None:
+                return (True, "feedback_already_exists")
+            
+            # 피드백이 없으면 업데이트
+            cursor = self.conn.execute("""
+                                       UPDATE translation_logger
+                                       SET user_feedback = ?
+                                       WHERE chat_message_id = ?
+                                       """, (feedback_value, chat_message_id))
+            self.conn.commit()
+            
+            if cursor.rowcount > 0:
+                return (True, "feedback_updated")
+            else:
+                return (False, "feedback_update_failed")
+        except Exception as e:
+            print(f"Feedback DB Update Error: {e}")
+            return (False, "feedback_update_error")
+        
     
     def log_translation_batch(self, results: list[dict], source: str = "api"):
         """

@@ -1,154 +1,299 @@
 # migrate_db_column.py
 """
-데이터베이스 컬럼명 변경 스크립트
-bm25_hybrid_rank → bm25_top_rank_in_hybrid
+데이터베이스 마이그레이션 유틸리티
+- 컬럼 추가
+- 컬럼 이름 변경
+- 범용적으로 사용 가능한 마이그레이션 함수 제공
 """
 
 import sqlite3
 from pathlib import Path
+from typing import Optional, List, Dict, Any
 
 DB_PATH = Path(__file__).parent / "database" / "translation_logger.db"
+TABLE_NAME = "translation_logger"
 
-def migrate_column_name():
+
+def get_table_columns(cursor: sqlite3.Cursor, table_name: str) -> List[tuple]:
+    """테이블의 컬럼 정보 조회"""
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    return cursor.fetchall()
+
+
+def column_exists(cursor: sqlite3.Cursor, table_name: str, column_name: str) -> bool:
+    """특정 컬럼이 존재하는지 확인"""
+    columns = get_table_columns(cursor, table_name)
+    return any(col[1] == column_name for col in columns)
+
+
+def add_column(
+    table_name: str = TABLE_NAME,
+    column_name: str = None,
+    column_type: str = "TEXT",
+    default_value: Any = None,
+    nullable: bool = True,
+    db_path: Path = DB_PATH
+) -> bool:
     """
-    SQLite는 컬럼명 변경을 직접 지원하지 않으므로
-    1. 새 테이블 생성
-    2. 데이터 복사
-    3. 기존 테이블 삭제
-    4. 테이블 이름 변경
+    테이블에 새로운 컬럼 추가
+    
+    Args:
+        table_name: 테이블 이름
+        column_name: 추가할 컬럼 이름
+        column_type: 컬럼 타입 (TEXT, INTEGER, REAL, BOOLEAN 등)
+        default_value: 기본값 (None이면 NULL)
+        nullable: NULL 허용 여부
+        db_path: 데이터베이스 파일 경로
+    
+    Returns:
+        성공 여부
     """
-    print(f"DB 경로: {DB_PATH}")
+    if not column_name:
+        print("❌ 컬럼 이름을 지정해주세요.")
+        return False
     
-    if not DB_PATH.exists():
-        print("⚠️ DB 파일이 없습니다. 새로 생성될 때 올바른 컬럼명이 사용됩니다.")
-        return
+    print(f"DB 경로: {db_path}")
     
-    conn = sqlite3.connect(DB_PATH)
+    if not db_path.exists():
+        print("⚠️ DB 파일이 없습니다.")
+        return False
+    
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    # 1. 현재 테이블 정보 확인
-    cursor.execute("PRAGMA table_info(translation_logger)")
-    columns = cursor.fetchall()
-    
-    # bm25_hybrid_rank 컬럼이 있는지 확인
-    has_old_column = any(col[1] == "bm25_hybrid_rank" for col in columns)
-    has_new_column = any(col[1] == "bm25_top_rank_in_hybrid" for col in columns)
-    
-    if not has_old_column:
-        if has_new_column:
-            print("✅ 이미 bm25_top_rank_in_hybrid 컬럼을 사용 중입니다.")
-        else:
-            print("⚠️ bm25_hybrid_rank 컬럼이 없습니다. 마이그레이션이 필요없습니다.")
-        conn.close()
-        return
-    
-    print("🔧 컬럼명 변경 시작...")
-    
     try:
-        # 2. 백업 테이블 생성
-        cursor.execute("""
-            CREATE TABLE translation_logger_backup AS 
-            SELECT * FROM translation_logger
-        """)
-        print("  ✓ 백업 생성")
+        # 컬럼 존재 여부 확인
+        if column_exists(cursor, table_name, column_name):
+            print(f"✅ '{column_name}' 컬럼이 이미 존재합니다.")
+            return True
         
-        # 3. 기존 테이블 삭제
-        cursor.execute("DROP TABLE translation_logger")
-        print("  ✓ 기존 테이블 삭제")
+        print(f"🔧 '{column_name}' 컬럼 추가 시작...")
         
-        # 4. 새 테이블 생성 (올바른 컬럼명으로)
-        cursor.execute("""
-            CREATE TABLE translation_logger (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                
-                -- 입력 정보
-                query TEXT,
-                query_len INTEGER,
-                src_lang TEXT,
-                mode TEXT,
-                
-                -- 출력 정보
-                translation TEXT,
-                reason TEXT,
-                
-                -- 검색 점수 (ML 피처로 사용)
-                top_score REAL,
-                candidate_gap REAL,
-                candidates_json TEXT,
-                
-                -- 매칭 유형 (ML 피처 + Weak Label 생성용)
-                is_exact_match BOOLEAN,
-                is_bm25_match BOOLEAN,
-                is_llm_fallback BOOLEAN,
-                
-                -- BM25 분석 정보 (Vector vs BM25 비교)
-                bm25_exact_rank INTEGER,
-                bm25_top_rank_in_hybrid INTEGER,
-                
-                -- segment/metadata 기반 feature
-                top_doc_type TEXT,
-                is_segment_exact_match INTEGER,
-                segment_parent_cn TEXT,
-                
-                -- glossary hints 관련 (1단계 대응)
-                has_glossary_hints BOOLEAN,
-                glossary_match_count INTEGER,
-                
-                -- 신뢰도 체크 관련 (1단계 대응)
-                passed_bm25_check BOOLEAN,
-                passed_gap_check BOOLEAN,
-                
-                -- 성능 관련
-                response_time_ms INTEGER,
-                
-                -- 메타 정보
-                source TEXT DEFAULT 'api'
-            )
-        """)
-        print("  ✓ 새 테이블 생성")
+        # ALTER TABLE로 컬럼 추가
+        column_def = f"{column_name} {column_type}"
         
-        # 5. 데이터 복사 (컬럼명 매핑)
-        cursor.execute("""
-            INSERT INTO translation_logger 
-            SELECT 
-                id, created_at, query, query_len, src_lang, mode,
-                translation, reason, top_score, candidate_gap, candidates_json,
-                is_exact_match, is_bm25_match, is_llm_fallback,
-                bm25_exact_rank, 
-                bm25_hybrid_rank,  -- 기존 컬럼명
-                top_doc_type, is_segment_exact_match, segment_parent_cn,
-                has_glossary_hints, glossary_match_count,
-                passed_bm25_check, passed_gap_check,
-                response_time_ms, source
-            FROM translation_logger_backup
-        """)
-        print(f"  ✓ 데이터 복사 완료 ({cursor.rowcount}개 행)")
+        if default_value is not None:
+            if isinstance(default_value, str):
+                column_def += f" DEFAULT '{default_value}'"
+            else:
+                column_def += f" DEFAULT {default_value}"
         
-        # 6. 백업 테이블 삭제
-        cursor.execute("DROP TABLE translation_logger_backup")
-        print("  ✓ 백업 삭제")
+        if not nullable:
+            column_def += " NOT NULL"
+        
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
         
         conn.commit()
-        print("✅ 마이그레이션 완료!")
+        print(f"✅ '{column_name}' 컬럼 추가 완료!")
+        return True
         
     except Exception as e:
         conn.rollback()
         print(f"❌ 에러 발생: {e}")
-        print("  롤백 중...")
-        
-        # 백업이 있다면 복원 시도
-        try:
-            cursor.execute("DROP TABLE IF EXISTS translation_logger")
-            cursor.execute("ALTER TABLE translation_logger_backup RENAME TO translation_logger")
-            conn.commit()
-            print("  ✓ 백업에서 복원 완료")
-        except:
-            print("  ❌ 복원 실패 - 수동으로 백업 테이블 확인 필요")
+        return False
     
     finally:
         conn.close()
 
+
+def rename_column(
+    table_name: str = TABLE_NAME,
+    old_column_name: str = None,
+    new_column_name: str = None,
+    db_path: Path = DB_PATH
+) -> bool:
+    """
+    컬럼 이름 변경 (SQLite는 ALTER TABLE RENAME COLUMN을 지원하지만,
+    복잡한 경우 테이블 재생성 방식 사용)
+    
+    Args:
+        table_name: 테이블 이름
+        old_column_name: 기존 컬럼 이름
+        new_column_name: 새 컬럼 이름
+        db_path: 데이터베이스 파일 경로
+    
+    Returns:
+        성공 여부
+    """
+    if not old_column_name or not new_column_name:
+        print("❌ 기존 컬럼명과 새 컬럼명을 지정해주세요.")
+        return False
+    
+    print(f"DB 경로: {db_path}")
+    
+    if not db_path.exists():
+        print("⚠️ DB 파일이 없습니다.")
+        return False
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    try:
+        # 컬럼 존재 여부 확인
+        has_old = column_exists(cursor, table_name, old_column_name)
+        has_new = column_exists(cursor, table_name, new_column_name)
+        
+        if not has_old:
+            if has_new:
+                print(f"✅ 이미 '{new_column_name}' 컬럼을 사용 중입니다.")
+            else:
+                print(f"⚠️ '{old_column_name}' 컬럼이 없습니다.")
+            return True
+        
+        print(f"🔧 컬럼명 변경 시작: {old_column_name} → {new_column_name}")
+        
+        # SQLite 3.25.0 이상에서 지원하는 RENAME COLUMN 사용
+        cursor.execute(f"ALTER TABLE {table_name} RENAME COLUMN {old_column_name} TO {new_column_name}")
+        
+        conn.commit()
+        print("✅ 컬럼명 변경 완료!")
+        return True
+        
+    except sqlite3.OperationalError as e:
+        # RENAME COLUMN을 지원하지 않는 경우 테이블 재생성 방식 사용
+        print(f"  ⚠️ RENAME COLUMN 미지원: {e}")
+        print("  🔄 테이블 재생성 방식으로 시도...")
+        conn.rollback()
+        
+        return _rename_column_with_table_recreation(
+            conn, cursor, table_name, old_column_name, new_column_name
+        )
+    
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ 에러 발생: {e}")
+        return False
+    
+    finally:
+        conn.close()
+
+
+def _rename_column_with_table_recreation(
+    conn: sqlite3.Connection,
+    cursor: sqlite3.Cursor,
+    table_name: str,
+    old_column_name: str,
+    new_column_name: str
+) -> bool:
+    """
+    테이블 재생성을 통한 컬럼 이름 변경
+    (RENAME COLUMN을 지원하지 않는 구버전 SQLite용)
+    """
+    try:
+        # 현재 테이블 스키마 가져오기
+        cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+        create_sql = cursor.fetchone()[0]
+        
+        # 백업 생성
+        backup_table = f"{table_name}_backup"
+        cursor.execute(f"CREATE TABLE {backup_table} AS SELECT * FROM {table_name}")
+        print(f"  ✓ 백업 생성")
+        
+        # 기존 테이블 삭제
+        cursor.execute(f"DROP TABLE {table_name}")
+        print(f"  ✓ 기존 테이블 삭제")
+        
+        # 새 테이블 생성 (컬럼명 변경)
+        new_create_sql = create_sql.replace(old_column_name, new_column_name)
+        cursor.execute(new_create_sql)
+        print(f"  ✓ 새 테이블 생성")
+        
+        # 모든 컬럼 이름 가져오기
+        columns = get_table_columns(cursor, backup_table)
+        column_names = [col[1] for col in columns]
+        columns_str = ", ".join(column_names)
+        
+        # 데이터 복사 (컬럼명 매핑)
+        new_columns = [new_column_name if c == old_column_name else c for c in column_names]
+        new_columns_str = ", ".join(new_columns)
+        
+        cursor.execute(f"""
+            INSERT INTO {table_name} ({new_columns_str})
+            SELECT {columns_str} FROM {backup_table}
+        """)
+        print(f"  ✓ 데이터 복사 완료 ({cursor.rowcount}개 행)")
+        
+        # 백업 삭제
+        cursor.execute(f"DROP TABLE {backup_table}")
+        print(f"  ✓ 백업 삭제")
+        
+        conn.commit()
+        print("✅ 컬럼명 변경 완료!")
+        return True
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ 에러 발생: {e}")
+        
+        # 백업에서 복원 시도
+        try:
+            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+            cursor.execute(f"ALTER TABLE {backup_table} RENAME TO {table_name}")
+            conn.commit()
+            print("  ✓ 백업에서 복원 완료")
+        except Exception as restore_error:
+            print(f"  ❌ 복원 실패: {restore_error}")
+        
+        return False
+
+
+def run_migrations():
+    """
+    실행할 마이그레이션 목록
+    새로운 마이그레이션이 필요할 때 여기에 추가
+    """
+    print("=" * 60)
+    print("데이터베이스 마이그레이션 시작")
+    print("=" * 60)
+    
+    migrations = [
+        # 과거 마이그레이션 (참고용)
+        # {
+        #     "type": "rename",
+        #     "old_name": "bm25_hybrid_rank",
+        #     "new_name": "bm25_top_rank_in_hybrid",
+        #     "description": "BM25 하이브리드 랭크 컬럼명 변경"
+        # },
+        
+        # 새로운 마이그레이션
+        {
+            "type": "add",
+            "column_name": "chat_message_id",
+            "column_type": "TEXT",
+            "default_value": None,
+            "nullable": True,
+            "description": "Bot chat message id 컬럼 추가"
+        }
+    ]
+    
+    for i, migration in enumerate(migrations, 1):
+        print(f"\n[{i}/{len(migrations)}] {migration['description']}")
+        print("-" * 60)
+        
+        if migration["type"] == "add":
+            success = add_column(
+                column_name=migration["column_name"],
+                column_type=migration["column_type"],
+                default_value=migration.get("default_value"),
+                nullable=migration.get("nullable", True)
+            )
+        elif migration["type"] == "rename":
+            success = rename_column(
+                old_column_name=migration["old_name"],
+                new_column_name=migration["new_name"]
+            )
+        else:
+            print(f"⚠️ 알 수 없는 마이그레이션 타입: {migration['type']}")
+            success = False
+        
+        if not success:
+            print(f"\n⚠️ 마이그레이션 실패. 다음 마이그레이션을 계속 진행합니다.")
+    
+    print("\n" + "=" * 60)
+    print("마이그레이션 완료")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
-    migrate_column_name()
+    run_migrations()
     
